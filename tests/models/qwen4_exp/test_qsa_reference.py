@@ -626,6 +626,83 @@ def test_qsa_mqa_paged_matches_test_reference(num_rows: int) -> None:
 
 
 @requires_qsa_kernels
+@pytest.mark.parametrize("mixed_requests", [False, True], ids=["homogeneous", "mixed"])
+def test_qsa_query_packing_preserves_original_scores(
+    monkeypatch: pytest.MonkeyPatch, mixed_requests: bool
+) -> None:
+    """Packing preserves per-row visibility and the original FP32 head reduction."""
+    torch.manual_seed(1)
+    rows, columns, max_visible = 511, 65600, 641
+    q = torch.randn(rows, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(4, 400, 1, 128, device="cuda", dtype=torch.bfloat16)
+    page_table = torch.full((2, 164), -1, device="cuda", dtype=torch.int32)
+    page_table[:, :2] = torch.tensor([[0, 1], [2, 3]], device="cuda")
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    token_to_req = torch.zeros_like(row_ids)
+    if mixed_requests:
+        # Boundaries cut across four-row groups; the final group has only three rows.
+        token_to_req.copy_((row_ids // 61) % 2)
+        token_to_req[40:42] = torch.tensor([-1, 2], device="cuda")
+        token_to_req[-3:] = torch.tensor([1, 0, -1], device="cuda")
+    lengths = torch.tensor(
+        [0, 1, 63, 64, 65, 399, 400, 401, 511, 512, 513, max_visible],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    requested_visible = lengths[row_ids.long() % lengths.numel()]
+    requested_visible[:4] = torch.tensor([1, 65, 400, max_visible], device="cuda")
+    query_positions = requested_visible * 4 + row_ids % 4 - 1
+    sequence_lengths = torch.tensor(
+        [4 * max_visible + 3, 4 * 463 + 1], device="cuda", dtype=torch.int32
+    )
+
+    # Adjacent-pair summation gives 2**24 + 2; reassociation can give 2**24 + 4.
+    q[:4].zero_()
+    q[:4, :, 0] = torch.tensor([2**24, 1, 2, 0], device="cuda", dtype=q.dtype)
+    cache[0, 0].zero_()
+    cache[0, 0, 0, 0] = 1
+    arguments = (q, cache, page_table, token_to_req, query_positions, sequence_lengths)
+    actual, actual_visible = qsa_ops.qsa_mqa_paged(
+        *arguments, compress_ratio=4, num_columns=columns, score_scale=1.0
+    )
+    original_launches = []
+
+    class OriginalScorer:
+        def __getitem__(self, grid: tuple[int, int]):
+            assert grid[0] == (rows + 3) // 4
+            original_launches.append(grid)
+            return qsa_ops._qsa_mqa_paged_kernel[(rows, grid[1])]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(qsa_ops, "_qsa_mqa_paged_packed_kernel", OriginalScorer())
+        expected, expected_visible = qsa_ops.qsa_mqa_paged(
+            *arguments, compress_ratio=4, num_columns=columns, score_scale=1.0
+        )
+    assert len(original_launches) == 1
+
+    valid_requests = (token_to_req >= 0) & (token_to_req < 2)
+    row_lengths = sequence_lengths[token_to_req.clamp(0, 1).long()]
+    row_lengths = torch.where(valid_requests, row_lengths, 0)
+    visible = torch.minimum(requested_visible, row_lengths // 4)
+    torch.testing.assert_close(actual_visible, visible, rtol=0, atol=0)
+    torch.testing.assert_close(expected_visible, visible, rtol=0, atol=0)
+    # Neither scorer defines columns beyond visibility; never compare those bytes.
+    defined = torch.arange(max_visible, device="cuda")[None, :] < visible[:, None]
+    torch.testing.assert_close(
+        actual[:, :max_visible][defined],
+        expected[:, :max_visible][defined],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        actual[:4, 0],
+        torch.full((4,), 2**24 + 2, device="cuda", dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )
+
+
+@requires_qsa_kernels
 def test_qsa_block_expansion_matches_test_reference() -> None:
     blocks = torch.tensor([[0, -1], [1, 0]], device="cuda", dtype=torch.int32)
     query_positions = torch.tensor([5, 10], device="cuda")
