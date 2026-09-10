@@ -1,0 +1,358 @@
+{
+  "schema_version": 1,
+  "scope": "Historical B200 measurements; not results against current main or a new GPU run of this backport.",
+  "date_utc": "2026-09-09",
+  "historical_backport": {
+    "base_commit": "80389cfedd5040e382d64a64b1782f66de1a38bf",
+    "base_executable_ast_matches_measured_original_except_module_docstring": true,
+    "base_source_sha256": "faa8d358c79745f304edd363e4da21992e4cf015a22316b14980500bd199a0ad",
+    "current_main_already_has_tiled_prefill_scorer": true,
+    "upstream_pr": "https://github.com/vllm-project/vllm/pull/54513",
+    "upstream_commit": "003e34341a824ab8e3bec4861e92b5e84180af8b",
+    "upstream_date": "2026-09-02",
+    "novelty_claim": false
+  },
+  "runtime": {
+    "vllm": "0.1.dev20073+g8e685d198",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "device": "NVIDIA B200",
+    "triton": "3.7.1",
+    "architecture": "SM100",
+    "image": "vllm/vllm-openai@sha256:0aea30240f3e3d9ffae8526643950e170eb5fa07fc427016a9dd90892afa2aa3"
+  },
+  "measured_sources": {
+    "original_sha256": "c4ffe3674cafa0ce2dabc39a39f0ddbb4b594bc358ad210ffce9d04383350c7f",
+    "candidate_sha256": "536d0ea6e3f69e9096b260141f47173b15380e82d0990ec3a37541f6bfb43fac",
+    "historical_result_sha256": "001aa83ff9e037c7270e1fa50aa8c86450a4dd4fb09362d9b401c0fcca40ae55",
+    "harness_sha256": {
+      "__init__.py": "fc382b2ae8776f07ccfb3e6773609ea66cf5ed4c9a70098911534deab14968d9",
+      "benchmark.py": "41e96ba548ad48509c14bc49eff3a471d7cc913f282615876636fe228987601c",
+      "kernel.py": "59b7573c12c82f92148f3a1d3d5f9d378e2b5e839c711149eeb8820e3241e534",
+      "patch.py": "18f8e3b4f6cce7dd87debe9f61b25a5de70bcd839363a9babfe7981390626c8a",
+      "test_contract.py": "b6a382ce2f09852f0084130373d9bde74a1af34aa7ea77284d1f29360066a0cd"
+    },
+    "helper_sha256": {
+      "prefill/qsa_index_scoring.py": "6b877325a9f658e1584134a9ee4aef881d64c671dac52e235a310de2ec2c85c3",
+      "prefill/native_selection.py": "d1b42721aef06d58f870006dd5c4aac274b37c98d94d19de50eafb2d3cfda26d",
+      "prefill/instruction_inspection/inspect.py": "9dc363ef1fedf6352943a4347a58b42860f2213b6baa8244964b5d466f817329"
+    },
+    "harness_location": "Separate lovstillery repository; not included in this backport."
+  },
+  "geometry": {
+    "query_dtype": "bfloat16",
+    "cache_dtype": "bfloat16",
+    "dispatch_rows": 511,
+    "query_heads": 4,
+    "kv_heads": 1,
+    "head_dimension": 128,
+    "compression_ratio": 4,
+    "indexer_token_budget": 2048,
+    "compressed_page_size": 400,
+    "column_capacity": 65600
+  },
+  "correctness": {
+    "checks_passed": 676,
+    "score_cases": 38,
+    "timing_cases": 24,
+    "exact_score_proxy_comparisons": 266,
+    "enabled_dispatch_comparisons": 98,
+    "enabled_dispatch_defined_values_across_repeats": 467153841,
+    "native_multiset_checks_passed": 21,
+    "ordered_native_differences_retained": 69,
+    "note": "Repeated fixtures include unchanged controls; counts are not independent examples. Native top-k order varies in original repeats."
+  },
+  "resources": {
+    "warps": 2,
+    "block_threads": 64,
+    "original_registers": [
+      78,
+      80
+    ],
+    "candidate_registers": 100,
+    "shared_bytes_both": 20992,
+    "spills_both": 0,
+    "tensor_memory_bytes_both": 0
+  },
+  "timing_contract": {
+    "operation": "8192-row scorer plus native top-k and token expansion",
+    "cache": "One shared synthetic input/cache allocation, warm repeated execution",
+    "paired_groups": 7,
+    "arm_order": "alternating by group",
+    "operations_per_graph": 4,
+    "graph_replays_per_event_interval": 1,
+    "retained_outputs_per_arm": 4,
+    "speedup": "Median of paired original/candidate ratios; not necessarily ratio of marginal medians.",
+    "mixed_layout": "Alternating request IDs; no complete group takes packed MMA path.",
+    "seed_rule": "9247 + rows + input_tokens"
+  },
+  "native_selector_timings": [
+    {
+      "input_tokens": 8192,
+      "request_layout": "homogeneous",
+      "original_median_us": 938.1279945373535,
+      "candidate_median_us": 542.3120260238647,
+      "median_paired_speedup": 1.7307612625233841,
+      "original_samples_us": [
+        938.9280080795288,
+        937.8479719161987,
+        937.2720122337341,
+        938.1440281867981,
+        937.4079704284668,
+        938.1279945373535,
+        938.647985458374
+      ],
+      "candidate_samples_us": [
+        542.3120260238647,
+        541.047990322113,
+        542.3679947853088,
+        542.3439741134644,
+        541.2319898605347,
+        542.03200340271,
+        542.3920154571533
+      ]
+    },
+    {
+      "input_tokens": 8192,
+      "request_layout": "mixed",
+      "original_median_us": 984.495997428894,
+      "candidate_median_us": 780.456006526947,
+      "median_paired_speedup": 1.2619801970065556,
+      "original_samples_us": [
+        985.7199788093567,
+        984.4880104064941,
+        985.4639768600464,
+        984.495997428894,
+        984.9200248718262,
+        984.2640161514282,
+        984.3999743461609
+      ],
+      "candidate_samples_us": [
+        781.2880277633667,
+        779.2239785194397,
+        781.2960147857666,
+        779.1200280189514,
+        780.456006526947,
+        781.6399931907654,
+        779.6720266342163
+      ]
+    },
+    {
+      "input_tokens": 32768,
+      "request_layout": "homogeneous",
+      "original_median_us": 2136.4800930023193,
+      "candidate_median_us": 1071.0400342941284,
+      "median_paired_speedup": 1.9962951894561043,
+      "original_samples_us": [
+        2136.4800930023193,
+        2135.215997695923,
+        2135.727882385254,
+        2134.7599029541016,
+        2138.3841037750244,
+        2138.1120681762695,
+        2138.200044631958
+      ],
+      "candidate_samples_us": [
+        1071.3520050048828,
+        1071.3119506835938,
+        1069.1280364990234,
+        1066.9679641723633,
+        1070.4079866409302,
+        1071.0400342941284,
+        1072.1039772033691
+      ]
+    },
+    {
+      "input_tokens": 32768,
+      "request_layout": "mixed",
+      "original_median_us": 1815.3599500656128,
+      "candidate_median_us": 1568.552017211914,
+      "median_paired_speedup": 1.1576077704399341,
+      "original_samples_us": [
+        1816.872000694275,
+        1814.4559860229492,
+        1815.7680034637451,
+        1814.5359754562378,
+        1815.392017364502,
+        1814.471960067749,
+        1815.3599500656128
+      ],
+      "candidate_samples_us": [
+        1568.560004234314,
+        1568.77601146698,
+        1568.552017211914,
+        1568.6479806900024,
+        1567.471981048584,
+        1567.512035369873,
+        1567.639946937561
+      ]
+    },
+    {
+      "input_tokens": 40527,
+      "request_layout": "homogeneous",
+      "original_median_us": 2524.672031402588,
+      "candidate_median_us": 1251.0000467300415,
+      "median_paired_speedup": 2.018552429802055,
+      "original_samples_us": [
+        2526.304006576538,
+        2524.4719982147217,
+        2525.007963180542,
+        2524.672031402588,
+        2524.4240760803223,
+        2525.0799655914307,
+        2524.240016937256
+      ],
+      "candidate_samples_us": [
+        1251.0000467300415,
+        1251.9279718399048,
+        1251.871943473816,
+        1251.1119842529297,
+        1248.5359907150269,
+        1250.9360313415527,
+        1248.3279705047607
+      ]
+    },
+    {
+      "input_tokens": 40527,
+      "request_layout": "mixed",
+      "original_median_us": 2092.1919345855713,
+      "candidate_median_us": 1875.3279447555542,
+      "median_paired_speedup": 1.1159246678295878,
+      "original_samples_us": [
+        2093.91188621521,
+        2091.991901397705,
+        2093.064069747925,
+        2091.279983520508,
+        2092.9598808288574,
+        2091.576099395752,
+        2092.1919345855713
+      ],
+      "candidate_samples_us": [
+        1875.5760192871094,
+        1875.1200437545776,
+        1875.6320476531982,
+        1873.7280368804932,
+        1875.831961631775,
+        1875.3279447555542,
+        1873.311996459961
+      ]
+    },
+    {
+      "input_tokens": 96516,
+      "request_layout": "homogeneous",
+      "original_median_us": 5175.19998550415,
+      "candidate_median_us": 2417.4320697784424,
+      "median_paired_speedup": 2.141035932885722,
+      "original_samples_us": [
+        5177.135944366455,
+        5175.19998550415,
+        5175.432205200195,
+        5174.528121948242,
+        5175.072193145752,
+        5174.272060394287,
+        5175.248146057129
+      ],
+      "candidate_samples_us": [
+        2417.4320697784424,
+        2416.872024536133,
+        2417.2561168670654,
+        2418.351888656616,
+        2417.7680015563965,
+        2417.7520275115967,
+        2415.3358936309814
+      ]
+    },
+    {
+      "input_tokens": 96516,
+      "request_layout": "mixed",
+      "original_median_us": 3936.8960857391357,
+      "candidate_median_us": 3848.0799198150635,
+      "median_paired_speedup": 1.0232073616124262,
+      "original_samples_us": [
+        3937.7360343933105,
+        3937.3199939727783,
+        3937.391996383667,
+        3936.5999698638916,
+        3936.8960857391357,
+        3936.7361068725586,
+        3936.5360736846924
+      ],
+      "candidate_samples_us": [
+        3848.0799198150635,
+        3846.5681076049805,
+        3848.088026046753,
+        3847.73588180542,
+        3849.3919372558594,
+        3847.368001937866,
+        3848.2959270477295
+      ]
+    }
+  ],
+  "worker_profile": {
+    "matched_requests": 1,
+    "prompt_tokens": 40527,
+    "prefill_chunk_tokens": [
+      8192,
+      8192,
+      8192,
+      8192,
+      7744,
+      15
+    ],
+    "target_calls_each_arm": 948,
+    "original_gpu_sum_ms": 83.807495,
+    "candidate_gpu_sum_ms": 33.758114,
+    "ratio_of_gpu_sums": 2.482588186058025,
+    "original_grid": [
+      511,
+      129,
+      1
+    ],
+    "candidate_grid": [
+      128,
+      129,
+      1
+    ],
+    "candidate_extra_autotuning_calls": 624,
+    "candidate_extra_autotuning_gpu_ms": 12.074321,
+    "candidate_qsa_cpu_scope_ms": 2634.007,
+    "note": "Single instrumented request with compilation/autotuning and different natural outputs; not steady-state request latency."
+  },
+  "serving_validation": {
+    "order": "ACCA",
+    "unique_projects": 100,
+    "measured_attempts": 400,
+    "warmups": 16,
+    "concurrency": 4,
+    "temperature": 0.7,
+    "reasoning_effort": "medium",
+    "speculative_tokens": 3,
+    "cache_mode": "cold",
+    "input_token_range": [
+      23360,
+      96516
+    ],
+    "output_token_cap": 65536,
+    "request_timeout_seconds": 646,
+    "measured_contract_failures": 10,
+    "failures_by_arm": {
+      "original_first": 2,
+      "candidate_first": 2,
+      "candidate_second": 3,
+      "original_second": 3
+    },
+    "failures_occur_in_both_arms": true,
+    "warmup_failures": 0,
+    "cap_hits": 0,
+    "status": "complete_but_rejected",
+    "effect_estimates": null,
+    "confidence_intervals": null,
+    "kernel_causality_established": false,
+    "end_to_end_gain_accepted": false,
+    "scope": "Historical text-only final-step requests; no raw requests or outputs included."
+  },
+  "backport_cuda_tests": {
+    "command": ".venv/bin/python -m pytest tests/models/qwen4_exp/test_qsa_reference.py -k query_packing -v",
+    "gpu_run_status": "not_run_for_this_backport"
+  }
+}
