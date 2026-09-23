@@ -69,6 +69,9 @@ class GDNAttentionMetadata:
     spec_sequence_masks_cpu: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
+    # Mixed batches only: the number of leading tokens owned by speculative
+    # decodes when every speculative request precedes every prefill, else 0.
+    spec_token_prefix: int = 0
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
     uniform_spec_sequence_length: int | None = None  # None for ragged batches
@@ -285,6 +288,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         uniform_spec_sequence_length = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        spec_token_prefix = 0
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
@@ -413,6 +417,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
+                # The stable sort keeps token order, so leading speculative
+                # requests make spec_token_indx exactly arange(prefix).
+                if bool(spec_sequence_masks_cpu[:num_spec_decodes].all()):
+                    spec_token_prefix = int(
+                        query_lens_cpu[:num_spec_decodes].sum().item()
+                    )
 
                 spec_state_indices_tensor = block_table_tensor[
                     spec_sequence_masks_cpu, : self.num_spec + 1
@@ -621,6 +631,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks_cpu=spec_sequence_masks_cpu,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
+            spec_token_prefix=spec_token_prefix,
             num_accepted_tokens=num_accepted_tokens,
             uniform_spec_sequence_length=uniform_spec_sequence_length,
             nums_dict=nums_dict,

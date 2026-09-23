@@ -276,6 +276,33 @@ def test_has_initial_state_after_reclassification():
     assert meta.has_initial_state[0].item() is True
 
 
+@pytest.mark.parametrize(
+    "seq_lens,query_lens,draft_tokens,expected_prefix",
+    [
+        pytest.param([80, 96, 64], [4, 4, 32], [3, 3, -1], 8, id="spec-first"),
+        pytest.param([64, 80], [32, 4], [-1, 3], 0, id="prefill-first"),
+        pytest.param([80, 96], [4, 4], [3, 3], 0, id="pure-spec"),
+        pytest.param([65, 20], [1, 4], [-1, 3], 0, id="reclassified-decode-first"),
+    ],
+)
+def test_spec_token_prefix(
+    seq_lens: list[int],
+    query_lens: list[int],
+    draft_tokens: list[int],
+    expected_prefix: int,
+):
+    """A mixed batch reports a speculative token prefix only when every
+    speculative request precedes every prefill, matching spec_token_indx."""
+    builder = _create_gdn_builder(num_speculative_tokens=3)
+    batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
+    meta = _build(builder, batch, num_decode_draft_tokens=draft_tokens)
+
+    assert meta.spec_token_prefix == expected_prefix
+    if expected_prefix:
+        assert meta.spec_token_indx is not None
+        assert meta.spec_token_indx.tolist() == list(range(expected_prefix))
+
+
 def test_full_cudagraph_spec_metadata_uses_request_count():
     """FULL cudagraph token padding must not pad request-indexed metadata."""
     num_speculative_tokens = 3
