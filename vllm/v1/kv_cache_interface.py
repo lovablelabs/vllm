@@ -1046,6 +1046,9 @@ class MambaSpec(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+    # A replicated state that may share a group with sharded states of the
+    # same page instead of taking whole blocks in a group of its own.
+    pack_with_sharded: bool = False
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -1102,7 +1105,11 @@ class MambaSpec(KVCacheSpec):
             and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
             and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
             and spec.page_size_bytes == self.page_size_bytes
-            and spec.tp_replicated == self.tp_replicated
+            and (
+                spec.tp_replicated == self.tp_replicated
+                or spec.pack_with_sharded
+                or self.pack_with_sharded
+            )
             for spec in kv_cache_specs.values()
         )
 

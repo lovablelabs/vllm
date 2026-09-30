@@ -172,6 +172,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
     def is_kv_cache_tp_replicated(self) -> bool:
         return True
 
+    @property
+    def pack_kv_cache_with_sharded(self) -> bool:
+        # Same page as a GDN state, so it fills a spare slot of a GDN group.
+        return True
+
     def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
         return PleShortConvAttentionBackend
 

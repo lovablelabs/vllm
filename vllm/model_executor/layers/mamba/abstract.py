@@ -58,6 +58,11 @@ class MambaBase(AttentionLayerBase):
     def is_kv_cache_tp_replicated(self) -> bool:
         return False
 
+    @property
+    def pack_kv_cache_with_sharded(self) -> bool:
+        """Whether a replicated state may share a group with sharded states."""
+        return False
+
     @abstractmethod
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         pass
@@ -73,6 +78,9 @@ class MambaBase(AttentionLayerBase):
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             tp_replicated=self.is_kv_cache_tp_replicated,
+            # KV transfer connectors expect each replicated state in its own group.
+            pack_with_sharded=self.pack_kv_cache_with_sharded
+            and vllm_config.kv_transfer_config is None,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
             # ReplaySSM verifies the whole window off one checkpoint, so it
             # never writes the baseline's per-draft-token state slots.

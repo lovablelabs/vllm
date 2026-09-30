@@ -4442,3 +4442,66 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
+
+
+def _qwen_ple_like_kv_cache_spec() -> dict[str, KVCacheSpec]:
+    """Qwen3.8 Flash-Next at TP2: 12 QSA layers (attention and indexer), 36 GDN
+    layers and one TP-replicated PLE conv state of the same page as a GDN
+    state, all at the hybrid block size."""
+    block_size = 3168
+    spec: dict[str, KVCacheSpec] = {}
+    for i in range(48):
+        if i % 4 == 3:
+            spec[f"layers.{i}.attn"] = FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=64,
+                dtype=torch.bfloat16,
+            )
+            spec[f"layers.{i}.indexer"] = MLAAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=48,
+                dtype=torch.bfloat16,
+            )
+        else:
+            spec[f"layers.{i}.linear_attn"] = new_mamba_spec(
+                block_size=block_size,
+                shapes=((228096,),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            )
+    spec["layers.1.ple"] = replace(spec["layers.0.linear_attn"], tp_replicated=True)
+    return spec
+
+
+@pytest.mark.parametrize("pack_with_sharded", [False, True])
+def test_tp_replicated_mamba_state_shares_a_sharded_group(pack_with_sharded: bool):
+    """A replicated state that opts in with pack_with_sharded fills a spare slot
+    of a sharded group's block instead of taking a group of its own."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    kv_cache_spec = _qwen_ple_like_kv_cache_spec()
+    kv_cache_spec["layers.1.ple"] = replace(
+        kv_cache_spec["layers.1.ple"], pack_with_sharded=pack_with_sharded
+    )
+
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+    mamba_groups = [
+        group.layer_names
+        for group in groups
+        if isinstance(group.kv_cache_spec.first_spec, MambaSpec)
+    ]
+    if pack_with_sharded:
+        assert sorted(map(len, mamba_groups)) == [12, 12, 13]
+        assert any("layers.1.ple" in names and len(names) > 1 for names in mamba_groups)
+    else:
+        assert sorted(map(len, mamba_groups)) == [1, 12, 12, 12]
+    # The attention group still sets the block, so the saving is the PLE
+    # group's blocks per request.
+    qsa_page = 12 * sum(
+        spec.page_size_bytes
+        for name, spec in kv_cache_spec.items()
+        if name in ("layers.3.attn", "layers.3.indexer")
+    )
+    assert kv_cache_utils._pool_bytes_per_block(vllm_config, groups) == qsa_page
