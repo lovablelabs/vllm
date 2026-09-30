@@ -618,6 +618,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if self.speculative_config is not None:
             logger.info_once("GDN spec decode kernel: %s", self.gdn_decode_kernel)
+        # Adaptive verification gives requests 1..K+1 rows each; the fused
+        # kernel then starts the longest requests first.
+        self.gdn_decode_longest_first = self.speculative_config is not None and bool(
+            self.speculative_config.enable_adaptive_verification
+        )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1882,6 +1887,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             scale=self.head_k_dim**-0.5,
             norm_eps=self.layer_norm_epsilon,
             output_gate_activation=self.norm.activation,
+            longest_first=self.gdn_decode_longest_first,
         )
 
     def _forward_core_fused_norm_packed(

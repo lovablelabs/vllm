@@ -387,3 +387,72 @@ def test_fused_gdn_decode_post_conv_mtp_head_ratios(
         )
 
     torch.testing.assert_close(state_actual, state_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_fused_gdn_decode_post_conv_mtp_longest_first_is_bitwise(
+    state_dtype: torch.dtype,
+) -> None:
+    """Starting the longest requests first only reorders blocks: outputs and
+    every stored state match the request-ordered launch bit for bit."""
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("fused GDN decode MTP requires compute capability 8.0+")
+    if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp"):
+        pytest.skip("fused GDN decode MTP op is not built")
+
+    torch.manual_seed(0)
+    device = "cuda"
+    H, HV, K, V, width = 2, 8, 128, 128, 8
+    # 31 requests x 8 heads is past the one-block-per-SM layout, with ragged
+    # rows including empty requests.
+    query_lengths = torch.randint(0, width + 1, (31,)).tolist()
+    num_reqs, num_tokens = len(query_lengths), sum(query_lengths)
+    num_slots = num_reqs * width + 1
+    mixed_qkv = torch.randn(
+        num_tokens, 2 * H * K + HV * V, dtype=torch.bfloat16, device=device
+    )
+    ba = torch.randn(num_tokens, 2 * HV, dtype=torch.bfloat16, device=device)
+    b, a = ba.chunk(2, dim=-1)
+    A_log = 0.5 * torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = 0.1 * torch.randn(HV, dtype=torch.float32, device=device)
+    output_gate = torch.randn(num_tokens, HV, V, dtype=torch.bfloat16, device=device)
+    norm_weight = torch.randn(V, dtype=torch.float32, device=device)
+    state = (
+        0.01 * torch.randn(num_slots, HV, V, K, dtype=torch.float32, device=device)
+    ).to(state_dtype)
+    state_indices = torch.arange(1, num_slots, dtype=torch.int32, device=device).view(
+        num_reqs, width
+    )
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(query_lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    num_accepted_tokens = torch.randint(
+        1, width + 1, (num_reqs,), dtype=torch.int32, device=device
+    )
+
+    results = []
+    for longest_first in (False, True):
+        state_copy = state.clone()
+        out = ops.fused_gdn_decode_post_conv_mtp(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_indices=state_indices,
+            cu_seqlens=cu_seqlens,
+            num_accepted_tokens=num_accepted_tokens,
+            state=state_copy,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            out=torch.zeros_like(output_gate),
+            scale=K**-0.5,
+            norm_eps=1e-6,
+            longest_first=longest_first,
+        )
+        results.append((out, state_copy))
+    torch.testing.assert_close(results[1][0], results[0][0], atol=0, rtol=0)
+    torch.testing.assert_close(results[1][1], results[0][1], atol=0, rtol=0)

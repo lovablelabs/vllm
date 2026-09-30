@@ -14,81 +14,20 @@
 
 namespace {
 
-template <typename StateT>
-__device__ __forceinline__ void cp_async_16b(StateT* smem_ptr,
-                                             const StateT* gmem_ptr) {
-  const uint32_t smem_addr =
-      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-               :
-               : "r"(smem_addr), "l"(gmem_ptr));
-}
-
-__device__ __forceinline__ void cp_async_commit() {
-  asm volatile("cp.async.commit_group;\n" ::);
-}
-
-__device__ __forceinline__ void cp_async_wait_all() {
-  asm volatile("cp.async.wait_all;\n" ::: "memory");
-}
-
-template <typename StateT, int ChunkV, int DimK, int Stages>
-__device__ __forceinline__ void copy_state_chunk(StateT* shared_state,
-                                                 const StateT* state, int chunk,
-                                                 int thread, int threads) {
-  constexpr int kElementsPerCopy = 16 / sizeof(StateT);
-  constexpr int kCopiesPerChunk = ChunkV * DimK / kElementsPerCopy;
-  const int stage = chunk % Stages;
-  for (int copy = thread; copy < kCopiesPerChunk; copy += threads) {
-    const int element = copy * kElementsPerCopy;
-    cp_async_16b(shared_state + stage * ChunkV * DimK + element,
-                 state + chunk * ChunkV * DimK + element);
-  }
-  cp_async_commit();
-}
-
-template <typename StateT>
-__device__ __forceinline__ float4 load_state4(const StateT* state);
-
-template <>
-__device__ __forceinline__ float4 load_state4<float>(const float* state) {
-  return *reinterpret_cast<const float4*>(state);
-}
-
-template <>
-__device__ __forceinline__ float4
-load_state4<__nv_bfloat16>(const __nv_bfloat16* state) {
-  const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(state);
-  const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(state + 2);
-  return make_float4(__bfloat162float(lo.x), __bfloat162float(lo.y),
-                     __bfloat162float(hi.x), __bfloat162float(hi.y));
-}
-
-template <typename StateT>
-__device__ __forceinline__ void store_state4(StateT* state, float4 value);
-
-template <>
-__device__ __forceinline__ void store_state4<float>(float* state,
-                                                    float4 value) {
-  *reinterpret_cast<float4*>(state) = value;
-}
-
-template <>
-__device__ __forceinline__ void store_state4<__nv_bfloat16>(
-    __nv_bfloat16* state, float4 value) {
-  *reinterpret_cast<__nv_bfloat162*>(state) =
-      __floats2bfloat162_rn(value.x, value.y);
-  *reinterpret_cast<__nv_bfloat162*>(state + 2) =
-      __floats2bfloat162_rn(value.z, value.w);
-}
-
 constexpr int kDimK = 128;
 constexpr int kDimV = 128;
-constexpr int kThreads = 256;
-constexpr int kWarps = kThreads / 32;
+// One V row per kRowThreads threads, each holding kKPerThread contiguous K
+// elements: a row's dot products reduce over 8 lanes, and state rows move as
+// 16-byte vectors. A 256-thread group covers one kChunkV-row chunk; a block
+// runs Groups of them at once.
+constexpr int kGroupThreads = 256;
 constexpr int kChunkV = 32;
 constexpr int kNumChunks = kDimV / kChunkV;
-constexpr int kRowsPerWarp = kChunkV / kWarps;
+constexpr int kRowThreads = 8;
+constexpr int kKPerThread = kDimK / kRowThreads;
+// Pads each thread's K slice in shared memory so the 8 slices of a row sit in
+// distinct banks.
+constexpr int kSlicePad = kKPerThread + 1;
 constexpr int kMaxMtpTokens = 8;
 constexpr int kDtBiasFloat32 = 0;
 constexpr int kDtBiasBFloat16 = 1;
@@ -147,8 +86,141 @@ __device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
   return {x, y};
 }
 
-template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate>
-__global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
+__device__ __forceinline__ float row_reduce_sum(float value) {
+  // The 8 lanes of one V row are consecutive within the warp.
+  value += __shfl_xor_sync(0xffffffffu, value, 4);
+  value += __shfl_xor_sync(0xffffffffu, value, 2);
+  value += __shfl_xor_sync(0xffffffffu, value, 1);
+  return value;
+}
+
+__device__ __forceinline__ void unpack_bf16x8(const uint4& packed, float* out) {
+  const __nv_bfloat162* pairs =
+      reinterpret_cast<const __nv_bfloat162*>(&packed);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 value = __bfloat1622float2(pairs[i]);
+    out[2 * i] = value.x;
+    out[2 * i + 1] = value.y;
+  }
+}
+__device__ __forceinline__ uint4 pack_bf16x8(const float* in) {
+  uint4 packed;
+  __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    pairs[i] = __floats2bfloat162_rn(in[2 * i], in[2 * i + 1]);
+  }
+  return packed;
+}
+
+__device__ __forceinline__ int row_bin(const int* __restrict__ cu_seqlens,
+                                       int request) {
+  const int rows = cu_seqlens[request + 1] - cu_seqlens[request];
+  return rows < 0 ? 0 : (rows > kMaxMtpTokens ? kMaxMtpTokens + 1 : rows);
+}
+
+// The request at `rank` once requests are ordered by row count, most rows
+// first and ties by index. Every lane of the calling warp computes it.
+__device__ __forceinline__ int request_at_rank(
+    const int* __restrict__ cu_seqlens, int num_requests, int rank, int lane) {
+  constexpr int kBins = kMaxMtpTokens + 2;
+  int counts[kBins];
+#pragma unroll
+  for (int bin = 0; bin < kBins; ++bin) {
+    counts[bin] = 0;
+  }
+  for (int base = 0; base < num_requests; base += 32) {
+    const int request = base + lane;
+    const int bin = request < num_requests ? row_bin(cu_seqlens, request) : -1;
+#pragma unroll
+    for (int b = 0; b < kBins; ++b) {
+      counts[b] += __popc(__ballot_sync(0xffffffffu, bin == b));
+    }
+  }
+  int target = 0;
+  int offset = rank;
+  bool found = false;
+#pragma unroll
+  for (int bin = kBins - 1; bin >= 0; --bin) {
+    if (!found) {
+      if (offset < counts[bin]) {
+        target = bin;
+        found = true;
+      } else {
+        offset -= counts[bin];
+      }
+    }
+  }
+  for (int base = 0; base < num_requests; base += 32) {
+    const int request = base + lane;
+    const int bin = request < num_requests ? row_bin(cu_seqlens, request) : -1;
+    unsigned mask = __ballot_sync(0xffffffffu, bin == target);
+    const int matches = __popc(mask);
+    if (offset < matches) {
+      for (int skip = 0; skip < offset; ++skip) {
+        mask &= mask - 1;
+      }
+      return base + __ffs(mask) - 1;
+    }
+    offset -= matches;
+  }
+  return rank;
+}
+
+// One thread's row slice as raw 16-byte vectors, loaded ahead of its use.
+template <typename StateT>
+struct RowSliceVectors {
+  static constexpr int kVectors = kKPerThread * sizeof(StateT) / sizeof(uint4);
+  uint4 v[kVectors];
+
+  __device__ __forceinline__ void load(const StateT* src) {
+#pragma unroll
+    for (int i = 0; i < kVectors; ++i) {
+      v[i] = reinterpret_cast<const uint4*>(src)[i];
+    }
+  }
+  __device__ __forceinline__ void unpack(float* h) const {
+    if constexpr (sizeof(StateT) == 2) {
+      unpack_bf16x8(v[0], h);
+      unpack_bf16x8(v[1], h + 8);
+    } else {
+#pragma unroll
+      for (int i = 0; i < kVectors; ++i) {
+        const float4 value = *reinterpret_cast<const float4*>(&v[i]);
+        h[4 * i] = value.x;
+        h[4 * i + 1] = value.y;
+        h[4 * i + 2] = value.z;
+        h[4 * i + 3] = value.w;
+      }
+    }
+  }
+};
+
+// The per-row states are written once and read at most once, a step later,
+// so they stream past L2 (st.global.cs) instead of evicting reused data.
+template <typename StateT>
+__device__ __forceinline__ void store_row_slice(StateT* dst, const float* h);
+template <>
+__device__ __forceinline__ void store_row_slice<__nv_bfloat16>(
+    __nv_bfloat16* dst, const float* h) {
+  __stcs(reinterpret_cast<uint4*>(dst), pack_bf16x8(h));
+  __stcs(reinterpret_cast<uint4*>(dst) + 1, pack_bf16x8(h + 8));
+}
+template <>
+__device__ __forceinline__ void store_row_slice<float>(float* dst,
+                                                       const float* h) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    __stcs(reinterpret_cast<float4*>(dst) + i,
+           make_float4(h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]));
+  }
+}
+
+template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate,
+          int Groups>
+__global__
+__launch_bounds__(kGroupThreads* Groups, 4 / Groups) void gdn_decode_post_conv_mtp_kernel(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
     const float* __restrict__ a_log, const void* __restrict__ dt_bias,
@@ -158,53 +230,78 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
     const void* __restrict__ norm_weight, __nv_bfloat16* __restrict__ out,
     int H, int HV, int state_indices_width, int dt_bias_type,
     bool norm_weight_is_bf16, float scale, float norm_eps,
-    GdnDecodeStrides strides) {
-  const int request = blockIdx.x;
-  const int value_head = blockIdx.y;
+    GdnDecodeStrides strides, bool longest_first) {
+  constexpr int kThreads = kGroupThreads * Groups;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
+  // longest_first: blockIdx.y is a rank in row count and blockIdx.x the head,
+  // so the longest requests start first and short ones fill the last wave.
+  const int value_head = longest_first ? blockIdx.x : blockIdx.y;
+  const int request =
+      longest_first ? request_at_rank(cu_seqlens, gridDim.y, blockIdx.y, lane)
+                    : blockIdx.x;
   const int bos = cu_seqlens[request];
   const int eos = cu_seqlens[request + 1];
   const int num_tokens = eos - bos;
   if (num_tokens <= 0) {
     return;
   }
-
-  const int accepted = num_accepted_tokens[request];
-  const int source_slot =
-      accepted > 0 && accepted <= state_indices_width
-          ? state_indices[request * state_indices_width + accepted - 1]
+  // The index row loads beside the accepted count rather than after it.
+  const int slot_value =
+      lane < state_indices_width
+          ? state_indices[request * state_indices_width + lane]
           : 0;
+  const int accepted = num_accepted_tokens[request];
+  const bool has_source = accepted > 0 && accepted <= state_indices_width;
+  const int source_lane = has_source ? accepted - 1 : 0;
+  const int source_slot =
+      has_source ? __shfl_sync(0xffffffffu, slot_value, source_lane) : 0;
   if (source_slot <= 0 || num_tokens > kMaxMtpTokens) {
     for (int linear = tid; linear < num_tokens * kDimV; linear += kThreads) {
       const int token = bos + linear / kDimV;
       const int value = linear % kDimV;
-      const int64_t out_offset =
-          (static_cast<int64_t>(token) * HV + value_head) * kDimV + value;
-      out[out_offset] = __float2bfloat16(0.0f);
+      out[(static_cast<int64_t>(token) * HV + value_head) * kDimV + value] =
+          __float2bfloat16(0.0f);
     }
     return;
   }
 
   const int key_head = value_head / ValueHeadsPerKeyHead;
-  __shared__ StateT shared_state[2][kChunkV][kDimK];
-  __shared__ float shared_q[kMaxMtpTokens][kDimK];
-  __shared__ float shared_k[kMaxMtpTokens][kDimK];
+  __shared__ float shared_q[kMaxMtpTokens][kRowThreads * kSlicePad];
+  __shared__ float shared_k[kMaxMtpTokens][kRowThreads * kSlicePad];
   __shared__ __nv_bfloat16 shared_v[kMaxMtpTokens][kDimV];
   __shared__ __nv_bfloat16 shared_out[kMaxMtpTokens][kDimV];
   __shared__ float shared_decay[kMaxMtpTokens];
   __shared__ float shared_beta[kMaxMtpTokens];
+  __shared__ int shared_slots[kMaxMtpTokens];
+  if (warp == 0 && lane < kMaxMtpTokens) {
+    shared_slots[lane] = slot_value;
+  }
 
-  StateT* source_state =
+  // The first chunk's state and the output gate load under the prologue.
+  const int group = tid / kGroupThreads;
+  const int group_tid = tid % kGroupThreads;
+  const int row = group_tid / kRowThreads;
+  const int slice = group_tid % kRowThreads;
+  const int64_t head_offset = static_cast<int64_t>(value_head) * kDimV * kDimK;
+  const StateT* source_state =
       state + static_cast<int64_t>(source_slot) * strides.state_slot +
-      value_head * kDimV * kDimK;
-  copy_state_chunk<StateT, kChunkV, kDimK, 2>(&shared_state[0][0][0],
-                                              source_state, 0, tid, kThreads);
+      head_offset;
+  RowSliceVectors<StateT> next_rows;
+  next_rows.load(source_state + (group * kChunkV + row) * kDimK +
+                 slice * kKPerThread);
+  float gate_inputs[4];
 
   if (warp < num_tokens) {
     const int t = warp;
     const int token = bos + t;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      gate_inputs[i] = __bfloat162float(
+          output_gate[static_cast<int64_t>(token) * strides.gate_row +
+                      value_head * kDimV + lane + i * 32]);
+    }
     const int64_t mixed_base = static_cast<int64_t>(token) * strides.mixed_row;
     float q_values[4];
     float k_values[4];
@@ -230,8 +327,9 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int dim = lane + i * 32;
-      shared_q[t][dim] = q_values[i] * q_scale;
-      shared_k[t][dim] = k_values[i] * k_scale;
+      const int padded = (dim / kKPerThread) * kSlicePad + dim % kKPerThread;
+      shared_q[t][padded] = q_values[i] * q_scale;
+      shared_k[t][padded] = k_values[i] * k_scale;
     }
     if (lane == 0) {
       const float a_value = __bfloat162float(
@@ -247,92 +345,45 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
   }
   __syncthreads();
 
-  const int k_base = lane * 4;
-  int rows[kRowsPerWarp];
-#pragma unroll
-  for (int row = 0; row < kRowsPerWarp; ++row) {
-    rows[row] = warp + row * kWarps;
-  }
-
-#pragma unroll
-  for (int chunk = 0; chunk < kNumChunks; ++chunk) {
-    cp_async_wait_all();
-    __syncthreads();
-    if (chunk + 1 < kNumChunks) {
-      copy_state_chunk<StateT, kChunkV, kDimK, 2>(
-          &shared_state[0][0][0], source_state, chunk + 1, tid, kThreads);
+#pragma unroll 1
+  for (int chunk = group; chunk < kNumChunks; chunk += Groups) {
+    const int value = chunk * kChunkV + row;
+    const int64_t row_offset = value * kDimK + slice * kKPerThread;
+    float h[kKPerThread];
+    next_rows.unpack(h);
+    if (chunk + Groups < kNumChunks) {
+      next_rows.load(source_state + row_offset + Groups * kChunkV * kDimK);
     }
-
-    float h[kRowsPerWarp][4];
-#pragma unroll
-    for (int row = 0; row < kRowsPerWarp; ++row) {
-      const float4 state_value =
-          load_state4(&shared_state[chunk & 1][rows[row]][k_base]);
-      h[row][0] = state_value.x;
-      h[row][1] = state_value.y;
-      h[row][2] = state_value.z;
-      h[row][3] = state_value.w;
-    }
-
     for (int t = 0; t < num_tokens; ++t) {
-      const float4 q4 = *reinterpret_cast<const float4*>(&shared_q[t][k_base]);
-      const float4 k4 = *reinterpret_cast<const float4*>(&shared_k[t][k_base]);
-      const float q_values[4] = {q4.x, q4.y, q4.z, q4.w};
-      const float k_values[4] = {k4.x, k4.y, k4.z, k4.w};
-
-      float dot_hk[kRowsPerWarp] = {0.0f, 0.0f, 0.0f, 0.0f};
+      const float decay = shared_decay[t];
+      const float* k_slice = &shared_k[t][slice * kSlicePad];
+      const float* q_slice = &shared_q[t][slice * kSlicePad];
+      float hk = 0.0f;
 #pragma unroll
-      for (int row = 0; row < kRowsPerWarp; ++row) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          h[row][i] *= shared_decay[t];
-          dot_hk[row] += h[row][i] * k_values[i];
-        }
+      for (int i = 0; i < kKPerThread; ++i) {
+        h[i] *= decay;
+        hk += h[i] * k_slice[i];
       }
-      const Sum2 dot_hk_01 = warp_reduce_sum_pair(dot_hk[0], dot_hk[1]);
-      const Sum2 dot_hk_23 = warp_reduce_sum_pair(dot_hk[2], dot_hk[3]);
-      const float reduced_hk[kRowsPerWarp] = {dot_hk_01.x, dot_hk_01.y,
-                                              dot_hk_23.x, dot_hk_23.y};
-
-      float dot_hq[kRowsPerWarp] = {0.0f, 0.0f, 0.0f, 0.0f};
+      hk = row_reduce_sum(hk);
+      const float delta =
+          (__bfloat162float(shared_v[t][value]) - hk) * shared_beta[t];
+      float hq = 0.0f;
 #pragma unroll
-      for (int row = 0; row < kRowsPerWarp; ++row) {
-        const int value = chunk * kChunkV + rows[row];
-        const float delta =
-            (__bfloat162float(shared_v[t][value]) - reduced_hk[row]) *
-            shared_beta[t];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          h[row][i] += k_values[i] * delta;
-          dot_hq[row] += h[row][i] * q_values[i];
-        }
+      for (int i = 0; i < kKPerThread; ++i) {
+        h[i] += k_slice[i] * delta;
+        hq += h[i] * q_slice[i];
       }
-      const Sum2 dot_hq_01 = warp_reduce_sum_pair(dot_hq[0], dot_hq[1]);
-      const Sum2 dot_hq_23 = warp_reduce_sum_pair(dot_hq[2], dot_hq[3]);
-      if (lane == 0) {
-        shared_out[t][chunk * kChunkV + rows[0]] =
-            __float2bfloat16(dot_hq_01.x);
-        shared_out[t][chunk * kChunkV + rows[1]] =
-            __float2bfloat16(dot_hq_01.y);
-        shared_out[t][chunk * kChunkV + rows[2]] =
-            __float2bfloat16(dot_hq_23.x);
-        shared_out[t][chunk * kChunkV + rows[3]] =
-            __float2bfloat16(dot_hq_23.y);
+      hq = row_reduce_sum(hq);
+      if (slice == 0) {
+        shared_out[t][value] = __float2bfloat16(hq);
       }
-
-      const int destination_slot =
-          state_indices[request * state_indices_width + t];
+      const int destination_slot = shared_slots[t];
       if (destination_slot > 0) {
-        StateT* destination_state =
+        store_row_slice<StateT>(
             state +
-            static_cast<int64_t>(destination_slot) * strides.state_slot +
-            value_head * kDimV * kDimK;
-#pragma unroll
-        for (int row = 0; row < kRowsPerWarp; ++row) {
-          const int value = chunk * kChunkV + rows[row];
-          store_state4(destination_state + value * kDimK + k_base,
-                       make_float4(h[row][0], h[row][1], h[row][2], h[row][3]));
-        }
+                static_cast<int64_t>(destination_slot) * strides.state_slot +
+                head_offset + row_offset,
+            h);
       }
     }
   }
@@ -355,19 +406,14 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int value = lane + i * 32;
-      const float gate_input = __bfloat162float(
-          output_gate[static_cast<int64_t>(token) * strides.gate_row +
-                      value_head * kDimV + value]);
-      const float gate =
-          SigmoidGate ? sigmoid_fast(gate_input) : silu_fast(gate_input);
+      const float gate = SigmoidGate ? sigmoid_fast(gate_inputs[i])
+                                     : silu_fast(gate_inputs[i]);
       const float weight =
           norm_weight_is_bf16
               ? __bfloat162float(
                     static_cast<const __nv_bfloat16*>(norm_weight)[value])
               : static_cast<const float*>(norm_weight)[value];
-      const int64_t out_offset =
-          (static_cast<int64_t>(token) * HV + value_head) * kDimV + value;
-      out[out_offset] =
+      out[(static_cast<int64_t>(token) * HV + value_head) * kDimV + value] =
           __float2bfloat16(output_values[i] * rstd * weight * gate);
     }
   }
@@ -383,7 +429,8 @@ void launch_gdn_decode_post_conv_mtp(
     torch::stable::Tensor& state, torch::stable::Tensor const& norm_weight,
     torch::stable::Tensor& out, const __nv_bfloat16* a, const __nv_bfloat16* b,
     const __nv_bfloat16* output_gate, int num_key_heads, int num_value_heads,
-    double scale, double norm_eps, GdnDecodeStrides strides) {
+    double scale, double norm_eps, GdnDecodeStrides strides,
+    bool longest_first) {
   using torch::headeronly::ScalarType;
 
   const auto dt_bias_scalar_type = dt_bias.scalar_type();
@@ -397,20 +444,35 @@ void launch_gdn_decode_post_conv_mtp(
   const cudaStream_t stream =
       get_current_cuda_stream(mixed_qkv.get_device_index());
   const int num_requests = static_cast<int>(state_indices.size(0));
-  const dim3 grid(num_requests, num_value_heads);
-  gdn_decode_post_conv_mtp_kernel<StateT, ValueHeadsPerKeyHead, SigmoidGate>
-      <<<grid, kThreads, 0, stream>>>(
-          static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr()), a, b,
-          static_cast<const float*>(a_log.data_ptr()), dt_bias.data_ptr(),
-          static_cast<const int*>(state_indices.data_ptr()),
-          static_cast<const int*>(cu_seqlens.data_ptr()),
-          static_cast<const int*>(num_accepted_tokens.data_ptr()),
-          static_cast<StateT*>(state.data_ptr()), output_gate,
-          norm_weight.data_ptr(), static_cast<__nv_bfloat16*>(out.data_ptr()),
-          num_key_heads, num_value_heads,
-          static_cast<int>(state_indices.size(1)), dt_bias_type,
-          norm_weight.scalar_type() == ScalarType::BFloat16,
-          static_cast<float>(scale), static_cast<float>(norm_eps), strides);
+  const auto launch = [&]<int Groups>() {
+    // Ordering pays off only where blocks outnumber the SMs (one group).
+    const bool ordered = Groups == 1 && longest_first;
+    const dim3 grid = ordered ? dim3(num_value_heads, num_requests)
+                              : dim3(num_requests, num_value_heads);
+    gdn_decode_post_conv_mtp_kernel<StateT, ValueHeadsPerKeyHead, SigmoidGate,
+                                    Groups>
+        <<<grid, kGroupThreads * Groups, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr()), a, b,
+            static_cast<const float*>(a_log.data_ptr()), dt_bias.data_ptr(),
+            static_cast<const int*>(state_indices.data_ptr()),
+            static_cast<const int*>(cu_seqlens.data_ptr()),
+            static_cast<const int*>(num_accepted_tokens.data_ptr()),
+            static_cast<StateT*>(state.data_ptr()), output_gate,
+            norm_weight.data_ptr(), static_cast<__nv_bfloat16*>(out.data_ptr()),
+            num_key_heads, num_value_heads,
+            static_cast<int>(state_indices.size(1)), dt_bias_type,
+            norm_weight.scalar_type() == ScalarType::BFloat16,
+            static_cast<float>(scale), static_cast<float>(norm_eps), strides,
+            ordered);
+  };
+  // Up to about one block per SM, a head's four chunks run side by side
+  // (B200, 1-4 requests x 24 heads: 0.74-0.78x the time of walking them in
+  // turn); beyond that, 256-thread blocks walk them in turn.
+  if (static_cast<int64_t>(num_requests) * num_value_heads <= 148) {
+    launch.template operator()<4>();
+  } else {
+    launch.template operator()<1>();
+  }
   const cudaError_t error = cudaGetLastError();
   STD_TORCH_CHECK(error == cudaSuccess,
                   "GDN decode MTP post-conv kernel launch failed: ",
@@ -428,7 +490,8 @@ void fused_gdn_decode_post_conv_mtp(
     torch::stable::Tensor const& num_accepted_tokens,
     torch::stable::Tensor& state, torch::stable::Tensor const& output_gate,
     torch::stable::Tensor const& norm_weight, torch::stable::Tensor& out,
-    double scale, double norm_eps, const std::string& output_gate_activation) {
+    double scale, double norm_eps, const std::string& output_gate_activation,
+    bool longest_first) {
   using torch::headeronly::ScalarType;
 
   STD_TORCH_CHECK(
@@ -559,7 +622,7 @@ void fused_gdn_decode_post_conv_mtp(
         mixed_qkv, a_log, dt_bias, state_indices, cu_seqlens,
         num_accepted_tokens, state, norm_weight, out, a_ptr, b_ptr,
         output_gate_ptr, num_key_heads, num_value_heads, scale, norm_eps,
-        strides);
+        strides, longest_first);
   };
   const auto dispatch_state_type = [&]<int ValueHeadsPerKeyHead>() {
     if (state_scalar_type == ScalarType::Float) {

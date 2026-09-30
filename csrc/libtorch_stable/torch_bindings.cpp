@@ -533,7 +533,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor state_indices, Tensor cu_seqlens, Tensor num_accepted_tokens, "
       "Tensor! state, Tensor output_gate, Tensor norm_weight, Tensor! out, "
       "float scale, float norm_eps=1e-5, "
-      "str output_gate_activation='silu') -> ()");
+      "str output_gate_activation='silu', bool longest_first=False) -> ()");
 #endif
 
 #ifdef VLLM_ENABLE_FUSED_KDA_CHUNK

@@ -2717,7 +2717,10 @@ def fused_gdn_decode_post_conv_mtp(
     scale: float = 128**-0.5,
     norm_eps: float = 1e-5,
     output_gate_activation: str = "silu",
+    longest_first: bool = False,
 ) -> torch.Tensor:
+    """``longest_first`` starts the requests with the most rows first; worth it
+    when row counts vary (adaptive verification), a small cost otherwise."""
     if out is None:
         out = torch.empty_like(output_gate)
     torch.ops._C.fused_gdn_decode_post_conv_mtp(
@@ -2736,6 +2739,7 @@ def fused_gdn_decode_post_conv_mtp(
         scale,
         norm_eps,
         output_gate_activation,
+        longest_first,
     )
     return out
 
