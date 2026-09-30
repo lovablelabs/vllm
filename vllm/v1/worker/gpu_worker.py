@@ -698,14 +698,23 @@ class Worker(WorkerBase):
         # the AMD-CI mem tests), and graph_pool_handle resolves to the same
         # torch.cuda handle the live capture path already uses on ROCm.
         cudagraph_memory_estimate = 0
+        capture_activation_estimate = 0
         if (
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ) and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+            # Eager steps that capture runs after the graphs (the adaptive
+            # verification profile) keep activations cached, and serving reuses
+            # them: budget only what exceeds profile_run's activation headroom.
+            capture_activation_estimate = max(
+                getattr(self.model_runner, "capture_activation_bytes", 0)
+                - profile_result.transient_peak_headroom,
+                0,
+            )
 
         # Respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate
+            cudagraph_memory_estimate + capture_activation_estimate
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
             else 0
         )
@@ -764,7 +773,9 @@ class Worker(WorkerBase):
         if cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory
             current_util = self.cache_config.gpu_memory_utilization
-            cg_util_delta = cudagraph_memory_estimate / total_mem
+            cg_util_delta = (
+                cudagraph_memory_estimate + capture_activation_estimate
+            ) / total_mem
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
                 equiv_util = round(current_util - cg_util_delta, 4)
                 suggested_util = min(

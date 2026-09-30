@@ -1068,6 +1068,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
         start_time = time.perf_counter()
+        # Device memory that eager steps after the graphs (the adaptive
+        # verification profile) leave cached; see determine_available_memory.
+        self.capture_activation_bytes = 0
         with freeze_gc_for_cudagraph_capture():
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -1105,12 +1108,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
                     if self.adaptive_verification is not None:
+                        # The profile's eager steps past the capture limit leave
+                        # their activations cached, where serving steps reuse them.
+                        # They are activations, not graphs: count them separately.
+                        profile_free_gpu_memory = torch.accelerator.get_memory_info()[0]
                         with self.step_timing.collect() as timings:
                             for batch in self.adaptive_verification.batches_to_profile(
                                 self.cudagraph_manager.captured_token_counts()
                             ):
                                 self._dummy_run(**batch)
                         self.adaptive_verification.set_initial_cost_curves(timings)
+                        self.capture_activation_bytes = max(
+                            profile_free_gpu_memory
+                            - torch.accelerator.get_memory_info()[0],
+                            0,
+                        )
                     self.kv_connector.reset_capture_state()
 
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -1122,7 +1134,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
-        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        cuda_graph_size = (
+            start_free_gpu_memory - end_free_gpu_memory - self.capture_activation_bytes
+        )
         # This usually takes 5~20 seconds.
         logger.info(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
