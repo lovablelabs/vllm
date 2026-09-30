@@ -552,9 +552,22 @@ class KVCacheManager:
         # Free on the processed-token basis: in-flight steps' attention windows
         # still read blocks below the optimistic boundary, and rejected spec
         # tokens can roll it back.
+        num_processed_tokens = max(
+            0, total_computed_tokens - request.num_in_flight_tokens
+        )
+        num_own_processed_tokens = (
+            request.num_computed_tokens - request.num_in_flight_tokens
+        )
+        if num_own_processed_tokens > 0 and not delay_cache_blocks:
+            # Cache the processed tokens' blocks before freeing skipped ones: an
+            # align-mode Mamba block is skipped as soon as the running state has
+            # moved past it. Prefix hits are not in the request's blocks yet.
+            self.coordinator.cache_blocks(
+                request, min(num_own_processed_tokens, request.num_tokens)
+            )
         self.coordinator.remove_skipped_blocks(
             request.request_id,
-            max(0, total_computed_tokens - request.num_in_flight_tokens),
+            num_processed_tokens,
             num_prompt_tokens=request.num_prompt_tokens,
         )
 

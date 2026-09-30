@@ -2701,6 +2701,52 @@ def test_hybrid_model_mamba_align_with_dynamic_draft_tokens():
     manager.free(req0)
 
 
+@pytest.mark.parametrize("num_speculative_blocks", [0, 4])
+@pytest.mark.parametrize("num_accepted", [3, 4])
+def test_hybrid_model_mamba_align_caches_a_boundary_passed_mid_window(
+    num_speculative_blocks: int, num_accepted: int
+):
+    """A verified window that crosses a block boundary leaves that boundary's
+    state checkpoint in the block before it. Whether the accepted tokens end
+    exactly on the boundary (13 + 3 = 16) or past it (13 + 4 = 17), the next
+    allocation must cache that block before it frees it as skipped."""
+    block_size = 16
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        block_size, 40, ["full", "mamba_align"]
+    )
+    kv_cache_config.kv_cache_groups[1] = KVCacheGroupSpec(
+        kv_cache_config.kv_cache_groups[1].layer_names,
+        replace(
+            kv_cache_config.kv_cache_groups[1].kv_cache_spec,
+            num_speculative_blocks=num_speculative_blocks,
+        ),
+    )
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        scheduler_block_size=block_size,
+    )
+    req = make_request("0", list(range(13)), block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req)
+    assert manager.allocate_slots(req, 13, num_computed_tokens, computed_blocks)
+    req.append_output_token_ids([100])
+    req.num_computed_tokens = 13
+    req.spec_token_ids = [101, 102, 103, 104]
+    assert manager.allocate_slots(req, num_new_tokens=5, num_new_computed_tokens=0)
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    boundary_block = mamba_manager.req_to_blocks["0"][0]
+
+    req.spec_token_ids = []
+    req.append_output_token_ids([101, 102, 103][: num_accepted - 1] + [200])
+    req.num_computed_tokens = 13 + num_accepted
+    req.spec_token_ids = [105, 106, 107, 108]
+    assert manager.allocate_slots(req, num_new_tokens=5, num_new_computed_tokens=0)
+
+    assert boundary_block.block_hash is not None
+
+
 def test_prefill_plp():
     """Test prefill with APC and some prompt logprobs (plp) requests.
 
