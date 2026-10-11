@@ -356,3 +356,37 @@ def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
     # (request, position) keys, so the kernel can mask rows the compacted
     # device layout no longer has room for.
     assert mapping == [0, 1, 2, 3, 4, 5, 6]
+
+
+@pytest.mark.parametrize("adaptive_verification", [False, True])
+def test_draft_prefill_replays_the_targets_varlen_graphs(
+    monkeypatch, adaptive_verification
+):
+    """The draft prefill replays the target's batch, which adaptive verification
+    trims to 1..num_speculative_steps + 1 rows per request: its graphs must be
+    varlen decode graphs too, or every trimmed step runs it outside FULL graphs.
+    """
+    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import (
+        speculator as ar_module,
+    )
+
+    managers = []
+
+    def manager(*args, **kwargs):
+        managers.append((args, kwargs))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(ar_module, "SpeculatorCudaGraphManager", manager)
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    speculator = MTPSpeculator.__new__(MTPSpeculator)
+    speculator.vllm_config = None
+    speculator.device = None
+    speculator.num_speculative_steps = 3
+    speculator.enable_adaptive_verification = adaptive_verification
+
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL_AND_PIECEWISE)
+
+    (prefill_args, prefill_kwargs), _ = managers
+    assert prefill_args[3] == 4
+    assert prefill_kwargs["varlen_decode"] is adaptive_verification

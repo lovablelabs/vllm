@@ -124,11 +124,14 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # Initialize cudagraph manager for draft prefill (draft position 0).
+        # It replays the target's batches, which adaptive verification trims
+        # to 1..num_speculative_steps + 1 rows per request.
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
             self.num_speculative_steps + 1,
+            varlen_decode=self.enable_adaptive_verification,
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
@@ -298,6 +301,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             uniform_token_count,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
+            max_query_len=input_batch.max_query_len,
             need_eager=is_profile,
             dp_sync_state=dp_sync_state,
         )
