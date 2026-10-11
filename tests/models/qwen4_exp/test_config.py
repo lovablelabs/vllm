@@ -167,6 +167,27 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> Non
             Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
 
 
+@pytest.mark.parametrize("method", ["dflash", "eagle3"])
+def test_qwen4_exp_accepts_dflash_without_enabling_other_drafters(method):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(), multimodal_config=None
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, enable_dbo=False, ubatch_size=1
+        ),
+        speculative_config=SimpleNamespace(method=method),
+    )
+    with patch.object(
+        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+    ):
+        if method == "eagle3":
+            with pytest.raises(NotImplementedError, match="supports only"):
+                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(config)
+        else:
+            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(config)
+
+
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     model_state = object.__new__(Qwen4ExpModelState)
     model_state.uses_ngram_embedding = True

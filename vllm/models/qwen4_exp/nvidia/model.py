@@ -32,10 +32,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -378,7 +380,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -459,6 +461,12 @@ class Qwen4ExpModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _aux_feature(self, multi_stream: torch.Tensor) -> torch.Tensor:
+        """Average the materialized hyper-connection streams for the drafter."""
+        return multi_stream.view(multi_stream.shape[0], self.config.hc_count, -1).mean(
+            dim=1
+        )
+
     @staticmethod
     def _start_layer_ple_prefetch(
         layer: nn.Module,
@@ -502,6 +510,11 @@ class Qwen4ExpModel(nn.Module):
             if intermediate_tensors is None:
                 raise ValueError("pipeline stage requires intermediate tensors")
             hidden_states = intermediate_tensors["hidden_states"]
+
+        aux_layers = self.aux_hidden_state_layers
+        aux_hidden_states: list[torch.Tensor] = []
+        if 0 in aux_layers:
+            aux_hidden_states.append(self._aux_feature(hidden_states))
 
         block_output = None
         injection = None
@@ -559,6 +572,18 @@ class Qwen4ExpModel(nn.Module):
                 injection = None
                 hidden_states = hidden_states + deepstack_embed
 
+            if layer_idx + 1 in aux_layers:
+                # Extract the completed state without replacing the delayed
+                # residual triple consumed by the next target layer.
+                materialized = (
+                    hidden_states
+                    if block_output is None
+                    else layer.mlp_hyper_connection.combine(
+                        hidden_states, block_output, injection
+                    )
+                )
+                aux_hidden_states.append(self._aux_feature(materialized))
+
         if not get_pp_group().is_last_rank:
             # PP transports one tensor, not the delayed HC tuple. Materialize
             # with the HC module that produced the pending injection.
@@ -581,6 +606,8 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if aux_hidden_states:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -635,6 +662,7 @@ class Qwen4ExpModel(nn.Module):
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,

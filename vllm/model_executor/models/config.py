@@ -942,10 +942,11 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             "mtp",
             "ngram",
             "ngram_gpu",
+            "dflash",
         }:
             raise NotImplementedError(
                 "Qwen4Exp speculative decoding supports only its native MTP "
-                "checkpoint and linear n-gram proposers"
+                "checkpoint, linear n-gram proposers and DFlash"
             )
 
 
