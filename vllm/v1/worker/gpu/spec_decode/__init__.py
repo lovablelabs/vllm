@@ -31,6 +31,15 @@ def init_speculator(
             )
 
             return LiLiCorrSpeculator(vllm_config, device)
+        if (
+            "DFlash2MTPDraftModel"
+            in speculative_config.draft_model_config.architectures
+        ):
+            from vllm.v1.worker.gpu.spec_decode.dflash2.mtp_speculator import (
+                DFlash2MTPSpeculator,
+            )
+
+            return DFlash2MTPSpeculator(vllm_config, device)
         if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
             from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
                 DFlash2Speculator,

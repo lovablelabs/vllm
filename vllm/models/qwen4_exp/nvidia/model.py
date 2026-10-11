@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
-from vllm.config import VllmConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
@@ -380,6 +380,19 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
+def _drafter_runs_mtp_layer(spec_config: SpeculativeConfig) -> bool:
+    """Whether the drafter runs this model's MTP layer, which starts from the
+    pre-final-mixer multi-stream hidden state."""
+    if spec_config.method == "mtp":
+        return True
+    draft_model_config = spec_config.draft_model_config
+    return (
+        spec_config.method == "dflash"
+        and draft_model_config is not None
+        and "DFlash2MTPDraftModel" in (draft_model_config.architectures or [])
+    )
+
+
 class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
@@ -439,14 +452,15 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
             self.hyper_connection_mixer = None
 
         spec_config = vllm_config.speculative_config
-        # MTP HC multi-stream outputs: when speculative method=="mtp" and the
-        # model uses HC with hc_count>1, retain the pre-final-mixer multi-stream
+        # MTP HC multi-stream outputs: when the drafter runs the MTP layer
+        # (method "mtp", or a DFlash2 head drafting through it) and the model
+        # uses HC with hc_count>1, retain the pre-final-mixer multi-stream
         # hidden state [T, hc_count*H] so the MTP drafter can feed a real
         # multi-stream backbone hidden on its first step (scheme A). Derived
         # purely from config (NOT node identity) so P/D nodes stay consistent.
         needs_mtp_hidden = (
             spec_config is not None
-            and getattr(spec_config, "method", None) == "mtp"
+            and _drafter_runs_mtp_layer(spec_config)
             and get_pp_group().is_last_rank
         )
         if needs_mtp_hidden:

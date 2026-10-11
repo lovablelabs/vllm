@@ -279,7 +279,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        mask_rows: torch.Tensor | None = None,
+        mask_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        """``mask_rows`` [T] flags rows without a backbone state (the mask rows
+        of a DFlash2 head that drafts through this layer): their projected
+        streams are ``mask_hidden_states`` [hc_count, H] instead."""
         hc_count = self.hc_count
         hidden_size = self.hidden_size
         prev_block_output: torch.Tensor | None = None
@@ -303,6 +308,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 num_tokens, hc_count, hidden_size
             )
             hidden_states = self.fc_hidden(hidden_states)
+            if mask_rows is not None:
+                assert mask_hidden_states is not None
+                hidden_states = torch.where(
+                    mask_rows[:, None, None],
+                    mask_hidden_states.to(hidden_states.dtype),
+                    hidden_states,
+                )
             hidden_states = hidden_states.flatten(-2)
             prev_block_output = inputs_embeds
         else:
@@ -412,6 +424,8 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        mask_rows: torch.Tensor | None = None,
+        mask_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
         return self.model(
             input_ids,
@@ -420,6 +434,8 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             intermediate_tensors,
             inputs_embeds,
             spec_step_idx=spec_step_idx,
+            mask_rows=mask_rows,
+            mask_hidden_states=mask_hidden_states,
         )
 
     def compute_logits(

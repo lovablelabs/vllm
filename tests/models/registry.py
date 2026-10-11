@@ -1471,6 +1471,9 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         max_model_len=8192,
         max_num_seqs=32,
     ),
+    # DFlash2 heads that draft through the target's MTP layer (Qwen4Exp) are
+    # not published yet.
+    "DFlash2MTPDraftModel": _HfExamplesInfo("", is_available_online=False),
     "DFlashLagunaForCausalLM": _HfExamplesInfo(
         "poolside/Laguna-XS-2.1-NVFP4",
         speculative_model="poolside/Laguna-XS-2.1-DFlash-NVFP4",

@@ -269,9 +269,14 @@ class DFlashSpeculator(DraftModelSpeculator):
             last_hidden_states = self.model(
                 input_ids=self.input_buffers.input_ids[:num_tokens],
                 positions=self.input_buffers.positions[:num_tokens],
-                inputs_embeds=None,
+                inputs_embeds=self._inputs_embeds(num_tokens),
             )
         return last_hidden_states
+
+    def _inputs_embeds(self, num_tokens: int) -> torch.Tensor | None:
+        """Input embeddings for drafters that do not embed the query tokens
+        themselves; None embeds ``input_ids``."""
+        return None
 
     def _generate_draft(
         self,
@@ -333,6 +338,20 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> None:
         """Publish context features required by a draft's candidate head."""
 
+    def run_query_passes(
+        self,
+        input_batch: InputBatch,
+        last_hidden_states: torch.Tensor,
+        dp_sync_state: DPSyncState | None,
+        dummy_run: bool,
+        skip_attn: bool,
+        is_profile: bool,
+    ) -> None:
+        """Hook for drafters that run more passes over the query block before
+        the draft forward. The query inputs (ids, positions, seq_lens) are laid
+        out, except under ``skip_attn`` (memory profiling), where no attention
+        metadata can be built either."""
+
     @torch.inference_mode()
     def propose(
         self,
@@ -391,6 +410,14 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
             )
+            self.run_query_passes(
+                input_batch,
+                last_hidden_states,
+                dp_sync_state,
+                dummy_run,
+                skip_attn=True,
+                is_profile=is_profile,
+            )
             # DFlash processes all speculative tokens in one forward pass,
             # so the real token count is num_query_tokens.
             self._prepare_eplb_forward(num_query_tokens)
@@ -444,6 +471,14 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+        self.run_query_passes(
+            input_batch,
+            last_hidden_states,
+            dp_sync_state,
+            dummy_run,
+            skip_attn=False,
+            is_profile=is_profile,
+        )
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(

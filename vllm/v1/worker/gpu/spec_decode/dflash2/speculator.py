@@ -223,13 +223,7 @@ class DFlash2Speculator(DFlashSpeculator):
         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
             num_reqs, self.num_speculative_steps, -1
         )
-        candidate_ids, unary_logits = self.model.compute_candidates(
-            hidden_states.flatten(0, 1)
-        )
-        candidate_ids = candidate_ids.view(
-            num_reqs, self.num_speculative_steps, self.top_k
-        )
-        unary_logits = unary_logits.view_as(candidate_ids)
+        candidate_ids, unary_logits = self._compute_candidates(hidden_states)
         scores = self._score_candidates(candidate_ids, unary_logits, hidden_states)
         self.candidate_sampler.sample(
             candidate_ids,
@@ -249,6 +243,20 @@ class DFlash2Speculator(DFlashSpeculator):
                 self.sample_idx_mapping[:num_sample],
                 self.sample_col[:num_sample],
             )
+
+    def _compute_candidates(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k candidate ids and logits per draft step, [num_reqs,
+        num_speculative_steps, top_k] each, from the steps' hidden states."""
+        num_reqs = hidden_states.shape[0]
+        candidate_ids, unary_logits = self.model.compute_candidates(
+            hidden_states.flatten(0, 1)
+        )
+        candidate_ids = candidate_ids.view(
+            num_reqs, self.num_speculative_steps, self.top_k
+        )
+        return candidate_ids, unary_logits.view_as(candidate_ids)
 
     def _score_candidates(
         self,
