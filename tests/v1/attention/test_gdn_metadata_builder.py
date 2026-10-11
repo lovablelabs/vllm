@@ -19,6 +19,7 @@ from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionBackend,
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
@@ -149,6 +150,7 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    adaptive_verification: bool = False,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
@@ -162,6 +164,9 @@ def _create_gdn_builder(
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",
             num_speculative_tokens=num_speculative_tokens,
+        )
+        vllm_config.speculative_config.enable_adaptive_verification = (
+            adaptive_verification
         )
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE,
@@ -522,3 +527,42 @@ def test_update_block_table_regathers_checkpoint(num_spec):
     assert not torch.equal(
         actual.checkpoint.state_indices, source.checkpoint.state_indices
     )
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_varlen_decode_graphs_under_adaptive_verification(adaptive: bool):
+    """Adaptive verification trims drafts on the device, so FULL decode graphs
+    replay 1 to num_spec + 1 tokens per request."""
+    builder = _create_gdn_builder(
+        num_speculative_tokens=3, full_cuda_graph=True, adaptive_verification=adaptive
+    )
+    assert GDNAttentionBackend.supports_device_cpu_query_lens_mismatch()
+    bound = GDNAttentionMetadataBuilder.get_varlen_cudagraph_max_query_len(
+        builder.vllm_config, builder.kv_cache_spec
+    )
+    assert bound == (4 if adaptive else None)
+
+
+def test_trimmed_spec_batch_follows_the_device_query_lengths():
+    """The host plans an even split of the draft budget (3 + 3 tokens) while
+    the device verifies 4 + 2: the spec rows must use the device offsets and
+    must not be reported as uniform."""
+    builder = _create_gdn_builder(
+        num_speculative_tokens=3, full_cuda_graph=True, adaptive_verification=True
+    )
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[3, 3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    device_query_start_loc = torch.tensor([0, 4, 6], dtype=torch.int32, device=DEVICE)
+    common = common.replace(query_start_loc=device_query_start_loc)
+    meta = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_decode_draft_tokens_cpu=torch.tensor([2, 2], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32, device=DEVICE),
+    )
+
+    assert meta.num_spec_decodes == 2
+    assert meta.num_spec_decode_tokens == 6
+    assert meta.uniform_spec_sequence_length is None
+    assert meta.spec_query_start_loc is not None
+    torch.testing.assert_close(meta.spec_query_start_loc, device_query_start_loc)

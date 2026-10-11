@@ -19,6 +19,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
@@ -26,7 +27,17 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
+
+
+def _uses_varlen_decode(vllm_config: VllmConfig) -> bool:
+    """Whether decode rows may hold fewer tokens on the device than the host
+    planned: adaptive verification trims each request's drafts on device."""
+    speculative_config = vllm_config.speculative_config
+    return (
+        speculative_config is not None
+        and speculative_config.enable_adaptive_verification
+    )
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -40,6 +51,14 @@ class GDNAttentionBackend(AttentionBackend):
 
     @classmethod
     def is_ssm(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # The spec-decode rows' query offsets, state slots and accepted counts
+        # all come from device tensors; the host only classifies rows and sizes
+        # the batch, and adaptive verification keeps the decode/prefill split
+        # and the token totals exact.
         return True
 
 
@@ -97,6 +116,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
     reorder_batch_threshold: int = 1
 
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> int | None:
+        # Every decode row takes the spec-decode path, which reads its
+        # per-request query offsets from the device and is sized by the state
+        # index width (num_speculative_tokens + 1), so a FULL graph replays any
+        # mix of 1 to max_decode_query_len tokens per request.
+        if _uses_varlen_decode(vllm_config):
+            return max_decode_query_len(vllm_config)
+        return None
+
     def __init__(
         self,
         kv_cache_spec: MambaSpec,
@@ -126,6 +159,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
+        self.varlen_decode: bool = _uses_varlen_decode(vllm_config)
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
         self.use_full_cuda_graph: bool = (
@@ -351,7 +385,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_sequence_masks_cpu = ~spec_sequence_masks_cpu
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             spec_query_lens_cpu = query_lens_cpu[spec_sequence_masks_cpu]
-            if spec_query_lens_cpu.numel() > 0:
+            # Under adaptive verification the host lengths are an even split
+            # of the drafts the device actually verifies.
+            if spec_query_lens_cpu.numel() > 0 and not self.varlen_decode:
                 first_spec_sequence_length = int(spec_query_lens_cpu[0])
                 if first_spec_sequence_length > 0 and bool(
                     torch.all(spec_query_lens_cpu == first_spec_sequence_length)

@@ -45,6 +45,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionType,
     MultipleOf,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
 from vllm.v1.attention.backends.flash_attn import (
@@ -59,7 +60,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from ..common.qsa_cache import QSAForwardMetadata
+from ..common.qsa_cache import QSAForwardMetadata, qsa_uses_varlen_decode
 from . import model
 from .indexer_qsa import QSAIndexer
 
@@ -141,6 +142,16 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
+    ) -> int | None:
+        # The QSA kernels attend per row (token_to_req) and never plan off
+        # this metadata's per-request lengths; flash-attn never runs here.
+        if qsa_uses_varlen_decode(vllm_config):
+            return max_decode_query_len(vllm_config)
+        return None
 
 
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):

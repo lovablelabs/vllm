@@ -31,6 +31,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.utils import (
     PAD_SLOT_ID,
@@ -594,12 +595,39 @@ class QSAForwardMetadata(AttentionMetadata):
     max_seq_len: int
     storage_block_size: int
     compress_ratio: int
+    # False when the decode rows' lengths are only known on the device
+    # (adaptive verification): decode_query_len is then their upper bound and
+    # the indexer selects them with its varlen kernel.
+    uniform_decode: bool = True
+
+
+def qsa_uses_varlen_decode(vllm_config: VllmConfig) -> bool:
+    """Whether QSA decode rows may hold fewer tokens on the device than the
+    host planned. Adaptive verification trims each request's drafts on device;
+    only the NVIDIA indexer selects such rows."""
+    speculative_config = vllm_config.speculative_config
+    return (
+        current_platform.is_cuda()
+        and speculative_config is not None
+        and speculative_config.enable_adaptive_verification
+    )
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    varlen_decode: bool = False
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
+    ) -> int | None:
+        # The per-token metadata comes from the device query_start_loc, and
+        # varlen decode rows are selected per request from it.
+        if qsa_uses_varlen_decode(vllm_config):
+            return max_decode_query_len(vllm_config)
+        return None
 
     def __init__(
         self,
@@ -611,6 +639,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         assert self.reorder_batch_threshold is not None
+        self.varlen_decode = qsa_uses_varlen_decode(vllm_config)
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
             compress_ratio = kv_cache_spec.tokens_per_state
@@ -662,13 +691,17 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=decode_threshold,
-                require_uniform=True,
+                require_uniform=not self.varlen_decode,
             )
         )
         assert num_decodes + num_prefills == common_attn_metadata.num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
         decode_query_len = 0
-        if num_decodes > 0:
+        uniform_decode = True
+        if num_decodes > 0 and self.varlen_decode:
+            decode_query_len = decode_threshold
+            uniform_decode = False
+        elif num_decodes > 0:
             query_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
             )
@@ -721,6 +754,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            uniform_decode=uniform_decode,
         )
 
 

@@ -13,6 +13,7 @@ from vllm.models.qwen4_exp.nvidia import indexer_qsa
 from vllm.models.qwen4_exp.nvidia import (
     model as _qwen4_exp_model,  # noqa: F401
 )
+from vllm.models.qwen4_exp.nvidia import qsa as qsa_backend
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
 from vllm.models.qwen4_exp.nvidia.qsa import qsa_kv_cache_dtype
@@ -297,6 +298,90 @@ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     ]
     assert metadata.slot_mapping.tolist() == list(range(12)) + [-1] * 4
     assert metadata.visible_blocks.tolist() == [65, 66, 67, 68] * 3 + [0] * 4
+
+
+def _varlen_config(adaptive: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            enable_adaptive_verification=adaptive,
+            num_speculative_tokens=3,
+            parallel_drafting=False,
+        ),
+        use_v2_model_runner=True,
+    )
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_qsa_builders_bound_varlen_decode_graphs_under_adaptive_verification(
+    monkeypatch: pytest.MonkeyPatch, adaptive: bool
+) -> None:
+    """Adaptive verification trims drafts on the device, so the FULL decode
+    graphs must replay 1 to num_speculative_tokens + 1 tokens per request."""
+    monkeypatch.setattr(qsa_cache.current_platform, "is_cuda", lambda: True)
+    expected = 4 if adaptive else None
+    for builder in (QSAMetadataBuilder, qsa_backend.Qwen4ExpQSAMetadataBuilder):
+        assert (
+            builder.get_varlen_cudagraph_max_query_len(_varlen_config(adaptive), None)
+            == expected
+        )
+
+
+def test_qsa_varlen_decode_stays_off_without_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the NVIDIA indexer selects varlen decode rows."""
+    monkeypatch.setattr(qsa_cache.current_platform, "is_cuda", lambda: False)
+    assert not qsa_cache.qsa_uses_varlen_decode(_varlen_config(True))
+    assert (
+        QSAMetadataBuilder.get_varlen_cudagraph_max_query_len(
+            _varlen_config(True), None
+        )
+        is None
+    )
+
+
+@requires_qsa_kernels
+def test_qsa_side_metadata_keeps_uneven_decode_rows_under_adaptive_verification() -> (
+    None
+):
+    """The host splits the draft budget evenly while the device verifies fewer
+    drafts for some requests: every row stays a decode row, decode_query_len is
+    the upper bound, and the per-token metadata follows the device offsets."""
+    device = torch.device("cuda")
+    builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
+    builder.varlen_decode = True
+    builder.compress_ratio = 1
+    builder.reorder_batch_threshold = 4
+    builder.is_circular_buffer = False
+    builder.storage_block_size = 64
+    builder.token_to_req_buffer = torch.empty(8, dtype=torch.int32, device=device)
+    builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64, device=device)
+    builder.logical_positions_buffer = torch.empty(8, dtype=torch.int64, device=device)
+    builder.visible_blocks_buffer = torch.empty(8, dtype=torch.int32, device=device)
+    builder.k_work_metadata_buffer = torch.empty(0, 2, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 4, 5, 8], dtype=torch.int32, device=device)
+    token_to_req = torch.tensor([0] * 4 + [1] + [2] * 3, device=device)
+    common = SimpleNamespace(
+        num_actual_tokens=8,
+        num_reqs=3,
+        max_query_len=4,
+        max_seq_len=68,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=torch.tensor([0, 3, 6, 8], dtype=torch.int32),
+        seq_lens=torch.tensor([68, 65, 67], dtype=torch.int32, device=device),
+        slot_mapping=torch.arange(8, device=device),
+        block_table_tensor=torch.empty((3, 0), dtype=torch.int32, device=device),
+        token_to_req_indices=lambda buffer: buffer.copy_(token_to_req),
+    )
+
+    metadata = builder.build(0, common)
+
+    assert (metadata.num_decodes, metadata.num_decode_tokens) == (3, 8)
+    assert metadata.num_prefills == 0
+    assert metadata.decode_query_len == 4
+    assert not metadata.uniform_decode
+    assert metadata.logical_positions.tolist() == [64, 65, 66, 67, 64, 64, 65, 66]
+    assert metadata.visible_blocks.tolist() == [65, 66, 67, 68, 65, 65, 66, 67]
 
 
 @requires_qsa_kernels
@@ -1190,6 +1275,111 @@ def test_qsa_split_selection_correctness(workspace_init, decode_query_len: int) 
         cache,
         page_table[2:],
         query_start_loc[2:],
+        visible_blocks[prefill_slice],
+        token_topk,
+        compress_ratio,
+        query_lens[-1],
+        block_indices[prefill_slice],
+        max_seq_len=sequence_lengths.max().item(),
+    )
+    # +1: the packed trailing count column (never a token index; excluded
+    # from the comparison).
+    actual = torch.empty(
+        (rows, token_topk + compress_ratio), device="cuda", dtype=torch.int32
+    )
+    qsa_indexer_ops.expand_qsa_block_indices(
+        block_indices,
+        query_positions,
+        visible_blocks,
+        compress_ratio,
+        token_topk,
+        actual,
+    )
+    expected_blocks = _qsa_select_paged_reference(
+        q,
+        cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        token_topk,
+        compress_ratio,
+    )
+    expected = _expand_qsa_indices_reference(
+        expected_blocks,
+        query_positions,
+        sequence_lengths.index_select(0, token_to_req.long()),
+        compress_ratio,
+        token_topk,
+    )
+
+    torch.testing.assert_close(
+        actual[:, : token_topk + compress_ratio - 1].sort().values,
+        expected.sort().values,
+    )
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("decode_lens", [[4, 1, 3], [4, 4, 4], [1, 1, 1]])
+def test_qsa_varlen_decode_selection_correctness(
+    workspace_init, decode_lens: list[int]
+) -> None:
+    """Under adaptive verification the indexer selects decode rows of uneven
+    length with the varlen kernel, bounded by the longest possible request."""
+    query_lens = decode_lens + [33]
+    num_reqs = len(query_lens)
+    num_decodes = len(decode_lens)
+    rows, heads, head_dim = sum(query_lens), 4, 128
+    token_topk, compress_ratio, max_decode_query_len = 2048, 4, 4
+    torch.manual_seed(17)
+    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(160, 16, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    page_table = torch.arange(160, device="cuda", dtype=torch.int32).view(4, 40)
+    token_to_req = torch.repeat_interleave(
+        torch.arange(num_reqs, device="cuda", dtype=torch.int32),
+        torch.tensor(query_lens, device="cuda"),
+    )
+    query_start_loc = torch.zeros(num_reqs + 1, device="cuda", dtype=torch.int32)
+    torch.cumsum(
+        torch.tensor(query_lens, device="cuda", dtype=torch.int32),
+        dim=0,
+        out=query_start_loc[1:],
+    )
+    sequence_lengths = torch.full(
+        (num_reqs,), 2560, device="cuda", dtype=torch.int32
+    )
+    query_positions = torch.cat(
+        [
+            torch.arange(2560 - query_len, 2560, device="cuda")
+            for query_len in query_lens
+        ]
+    )
+    block_indices = torch.empty(
+        rows, token_topk // compress_ratio, device="cuda", dtype=torch.int32
+    )
+    visible_blocks = torch.minimum(
+        (query_positions + 1) // compress_ratio,
+        sequence_lengths.index_select(0, token_to_req.long()) // compress_ratio,
+    ).to(torch.int32)
+    num_decode_tokens = sum(decode_lens)
+    decode_slice = slice(0, num_decode_tokens)
+    qsa_indexer_ops.qsa_select_paged_decode(
+        q[decode_slice],
+        cache,
+        page_table[:num_decodes],
+        visible_blocks[decode_slice],
+        token_topk,
+        compress_ratio,
+        max_decode_query_len,
+        block_indices[decode_slice],
+        query_start_loc=query_start_loc[: num_decodes + 1],
+    )
+    prefill_slice = slice(num_decode_tokens, rows)
+    qsa_indexer_ops.qsa_select_paged_prefill(
+        q[prefill_slice],
+        cache,
+        page_table[num_decodes:],
+        query_start_loc[num_decodes:],
         visible_blocks[prefill_slice],
         token_topk,
         compress_ratio,

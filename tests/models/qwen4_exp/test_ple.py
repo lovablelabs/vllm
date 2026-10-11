@@ -48,6 +48,7 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import weak_ref_tensor
 from vllm.v1.attention.backends.short_conv_attn import (
+    PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
     PleShortConvAttentionMetadataBuilder,
 )
@@ -2273,3 +2274,22 @@ def test_amd_ngram_embedding_matches_reference_under_compile(
     )
     expected = loaded_weight[ngram_ids.cpu()].flatten(-2).to(device)
     torch.testing.assert_close(output.float(), expected.float(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_ple_short_conv_bounds_varlen_decode_graphs_under_adaptive_verification(
+    adaptive: bool,
+) -> None:
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            enable_adaptive_verification=adaptive,
+            num_speculative_tokens=3,
+            parallel_drafting=False,
+        ),
+        use_v2_model_runner=True,
+    )
+    assert PleShortConvAttentionBackend.supports_device_cpu_query_lens_mismatch()
+    bound = PleShortConvAttentionMetadataBuilder.get_varlen_cudagraph_max_query_len(
+        config, None
+    )
+    assert bound == (4 if adaptive else None)

@@ -431,8 +431,25 @@ class QSAIndexer(nn.Module):
             device=q.device,
         )
 
-        # Decode requests occupy the leading rows and share one query length.
-        if num_decode_tokens:
+        # Decode requests occupy the leading rows. They share one query length,
+        # except under adaptive verification, where the device decides each
+        # request's length and the decode kernel reads the rows from the
+        # query offsets, bounded by the longest possible request.
+        if num_decode_tokens and not compressed_metadata.uniform_decode:
+            num_decodes = compressed_metadata.num_decodes
+            decode_slice = slice(0, num_decode_tokens)
+            qsa_select_paged_decode(
+                q[decode_slice],
+                compressed_key_cache,
+                compressed_metadata.block_table[:num_decodes],
+                visible_blocks[decode_slice],
+                self.token_topk,
+                self.compress_ratio,
+                decode_query_len,
+                block_indices[decode_slice],
+                query_start_loc=compressed_metadata.query_start_loc[: num_decodes + 1],
+            )
+        elif num_decode_tokens:
             num_decodes = compressed_metadata.num_decodes
             if num_decodes * decode_query_len != num_decode_tokens:
                 raise ValueError("QSA decode rows must form a uniform request batch")

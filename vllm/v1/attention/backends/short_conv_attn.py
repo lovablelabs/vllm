@@ -11,6 +11,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     CommonAttentionMetadata,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.mamba_attn import (
     BaseMambaAttentionMetadata,
@@ -20,7 +21,7 @@ from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     mamba_get_block_table_tensor,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 
 class ShortConvAttentionBackend(AttentionBackend):
@@ -95,6 +96,13 @@ class PleShortConvAttentionBackend(ShortConvAttentionBackend):
     def get_name() -> str:
         return "PLE_SHORT_CONV_ATTN"
 
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # Spec-decode rows read their query offsets, state slots and accepted
+        # counts from device tensors; the host only classifies rows and sizes
+        # the batch, which adaptive verification keeps exact.
+        return True
+
     @staticmethod
     def get_builder_cls() -> type["PleShortConvAttentionMetadataBuilder"]:
         return PleShortConvAttentionMetadataBuilder
@@ -108,6 +116,20 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
     reorder_batch_threshold: int = 1
     supports_update_block_table = False
     needs_causal_conv1d_metadata = False
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
+    ) -> int | None:
+        # Every decode row takes the spec-decode path, which reads its
+        # per-request query offsets from the device.
+        speculative_config = vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.enable_adaptive_verification
+        ):
+            return max_decode_query_len(vllm_config)
+        return None
 
     def __init__(
         self,
