@@ -310,6 +310,7 @@ class DraftModelSpeculator(BaseSpeculator):
         causal: bool | Mapping[int, bool] = True,
         dcp_local_seq_lens: torch.Tensor | None = None,
         slot_mappings: torch.Tensor | None = None,
+        attn_groups: list[list[AttentionGroup]] | None = None,
     ) -> dict[str, Any] | None:
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         # A FULL graph replays a captured shape whose padded requests each hold
@@ -354,7 +355,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.block_tables.cp_interleave,
             )
         attn_metadata = build_attn_metadata(
-            attn_groups=self.attn_groups,
+            attn_groups=self.attn_groups if attn_groups is None else attn_groups,
             num_reqs=num_reqs_padded,
             num_tokens=num_tokens,
             query_start_loc_gpu=self.input_buffers.query_start_loc[

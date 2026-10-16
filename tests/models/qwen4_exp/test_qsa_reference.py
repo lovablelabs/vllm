@@ -538,6 +538,21 @@ def test_qsa_ring_capacity_covers_one_speculative_step(
     assert spec.block_size == expected
 
 
+def test_qsa_ring_holds_the_merged_mtp_pass_of_a_dflash2_head() -> None:
+    """A DFlash2 head drafting through the MTP layer writes 1 + 2K rows per
+    request in one forward: the ring grows by whole groups to hold them plus
+    the open group and still divides the attention block size."""
+    config = SimpleNamespace(
+        num_speculative_tokens=7,
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(architectures=["DFlash2MTPDraftModel"])
+        ),
+    )
+    spec = _qsa_key_cache(block_size=1776, compress_ratio=4).get_kv_cache_spec(config)
+    # 4 + 15 - 1 = 18 rows -> 20, which 1776 is not a multiple of -> 24.
+    assert spec.block_size == 24
+
+
 def test_qsa_kv_cache_dtype_honors_skip_layers() -> None:
     """``--kv-cache-dtype-skip-layers`` keeps the listed QSA layers unquantized.
 
@@ -1345,9 +1360,7 @@ def test_qsa_varlen_decode_selection_correctness(
         dim=0,
         out=query_start_loc[1:],
     )
-    sequence_lengths = torch.full(
-        (num_reqs,), 2560, device="cuda", dtype=torch.int32
-    )
+    sequence_lengths = torch.full((num_reqs,), 2560, device="cuda", dtype=torch.int32)
     query_positions = torch.cat(
         [
             torch.arange(2560 - query_len, 2560, device="cuda")

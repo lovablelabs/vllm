@@ -38,9 +38,17 @@ from vllm.model_executor.models.qwen3_dflash2_mtp import (
     get_phase_e_config,
     get_pos1_source,
 )
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.worker.gpu.attn_utils import (
+    build_slot_mappings_by_layer,
+    init_attn_backend,
+)
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
@@ -73,6 +81,76 @@ def mtp_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
         target_parallel_config=vllm_config.parallel_config,
     )
     return config
+
+
+@triton.jit
+def _merged_inputs_kernel(
+    input_ids_ptr,
+    positions_ptr,
+    hidden_ptr,
+    seq_lens_ptr,
+    anchor_ptr,
+    target_input_ids_ptr,
+    target_positions_ptr,
+    target_hidden_ptr,
+    target_hidden_stride,
+    target_query_start_loc_ptr,
+    idx_mapping_ptr,
+    last_sampled_ptr,
+    next_prefill_tokens_ptr,
+    num_sampled_ptr,
+    num_rejected_ptr,
+    mask_token_id,
+    num_rows,
+    max_num_reqs,
+    hidden_size,
+    BLOCK: tl.constexpr,
+    HIDDEN_BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    # Axis 1: one program per row that may be accepted copies its streams.
+    row = tl.program_id(1)
+    num_reqs = tl.num_programs(0)
+    q_start = tl.load(target_query_start_loc_ptr + req)
+    q_end = tl.load(target_query_start_loc_ptr + req + 1)
+    num_valid = q_end - q_start - tl.load(num_rejected_ptr + req)
+    m_start = req * num_rows
+    if row < num_valid:
+        src = target_hidden_ptr + (q_start + row).to(tl.int64) * target_hidden_stride
+        dst = hidden_ptr + (m_start + row).to(tl.int64) * hidden_size
+        for h in range(0, hidden_size, HIDDEN_BLOCK):
+            cols = h + tl.arange(0, HIDDEN_BLOCK)
+            mask = cols < hidden_size
+            tl.store(dst + cols, tl.load(src + cols, mask=mask), mask=mask)
+    if row == 0:
+        # As the draft prefill: the last verified row's input is the token
+        # sampled after it.
+        req_state = tl.load(idx_mapping_ptr + req)
+        if tl.load(num_sampled_ptr + req) > 0:
+            next_token = tl.load(last_sampled_ptr + req_state).to(tl.int32)
+        else:
+            next_token = tl.load(next_prefill_tokens_ptr + req_state).to(tl.int32)
+        first_pos = tl.load(target_positions_ptr + q_start)
+        for i in range(0, num_rows, BLOCK):
+            j = i + tl.arange(0, BLOCK)
+            in_rows = j < num_rows
+            shifted = j < num_valid - 1
+            token = tl.load(
+                target_input_ids_ptr + q_start + j + 1, mask=in_rows & shifted, other=0
+            )
+            token = tl.where(
+                shifted, token, tl.where(j == num_valid - 1, next_token, mask_token_id)
+            )
+            tl.store(input_ids_ptr + m_start + j, token, mask=in_rows)
+            tl.store(positions_ptr + m_start + j, first_pos + j, mask=in_rows)
+        tl.store(anchor_ptr + req, (m_start + num_valid - 1).to(tl.int64))
+        tl.store(seq_lens_ptr + req, first_pos + num_rows)
+        if req == num_reqs - 1:
+            # Requests a CUDA graph pads the batch with: empty, anchor row 0.
+            for i in range(num_reqs, max_num_reqs, BLOCK):
+                k = i + tl.arange(0, BLOCK)
+                tl.store(seq_lens_ptr + k, 0, mask=k < max_num_reqs)
+                tl.store(anchor_ptr + k, 0, mask=k < max_num_reqs)
 
 
 class _PrivateSlotBlockTables:
@@ -145,10 +223,30 @@ class MTPBlockSpeculator(MTPSpeculator):
                 device=device,
             )
 
+        # Decode-only steps run the prefill and the block pass as one forward:
+        # [verified rows | K mask rows | padding], 1 + 2K rows per request at
+        # the positions after the request's first verified one.
+        self.merged_rows = 2 * num_block_rows - 1
+        max_num_merged_rows = self.max_num_reqs * self.merged_rows
+        self.merged_input_ids = torch.zeros(
+            max_num_merged_rows, dtype=torch.int32, device=device
+        )
+        self.merged_hidden_states = torch.zeros(
+            max_num_merged_rows, self.hidden_size, dtype=self.dtype, device=device
+        )
+        self.merged_anchors = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=device
+        )
+        self.query_start_loc_merged = self.query_start_loc_pos1 * self.merged_rows
+        self.block_offsets = torch.arange(num_block_rows, device=device)
+        self.use_merged_pass = False
+
         self.block_slot_mappings: torch.Tensor | None = None
         self.pos1_slot_mappings: torch.Tensor | None = None
+        self.merged_slot_mappings: torch.Tensor | None = None
         self.block_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.pos1_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+        self.merged_cudagraph_manager: SpeculatorCudaGraphManager | None = None
 
     def bind_head(
         self, head: nn.Module, head_input_buffers: InputBuffers, top_k: int
@@ -212,6 +310,58 @@ class MTPBlockSpeculator(MTPSpeculator):
             self.pos1_slot_mappings = torch.full_like(
                 block_tables.slot_mappings, PAD_SLOT_ID
             )
+        self.use_merged_pass = self._ring_holds_merged_rows(kv_cache_config)
+        if self.use_merged_pass:
+            self.merged_slot_mappings = torch.full_like(
+                block_tables.slot_mappings, PAD_SLOT_ID
+            )
+            # Builders of its own whose decode threshold takes the merged
+            # rows, which the other passes' builders would treat as prefills.
+            self.merged_attn_groups, _, _ = init_attn_backend(
+                kv_cache_config,
+                self.attn_vllm_config,
+                self.device,
+                active_layer_names=self.draft_attn_layer_names,
+            )
+            for groups in self.merged_attn_groups:
+                for group in groups:
+                    for builder in group.metadata_builders:
+                        if builder.reorder_batch_threshold is not None:
+                            builder.reorder_batch_threshold = max(
+                                builder.reorder_batch_threshold, self.merged_rows
+                            )
+
+    def _ring_holds_merged_rows(self, kv_cache_config: KVCacheConfig) -> bool:
+        """Whether every QSA indexer ring holds the merged pass's rows plus
+        the open group's committed keys."""
+        ratio = int(
+            getattr(
+                self.vllm_config.model_config.hf_text_config,
+                "indexer_compress_ratio",
+                1,
+            )
+            or 1
+        )
+        capacities = []
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            specs = (
+                spec.kv_cache_specs.values()
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else [spec]
+            )
+            capacities += [
+                x.block_size for x in specs if isinstance(x, CircularBufferSpec)
+            ]
+        need = self.merged_rows + ratio - 1
+        if capacities and min(capacities) < need:
+            logger.info(
+                "The merged MTP pass is off: the QSA ring holds %d rows, it needs %d.",
+                min(capacities),
+                need,
+            )
+            return False
+        return True
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # The prefill replays the target's batch shapes.
@@ -233,6 +383,10 @@ class MTPBlockSpeculator(MTPSpeculator):
         if self.use_pos1_pass:
             self.pos1_cudagraph_manager = SpeculatorCudaGraphManager(
                 self.vllm_config, self.device, cudagraph_mode, decode_query_len=1
+            )
+        if self.use_merged_pass:
+            self.merged_cudagraph_manager = SpeculatorCudaGraphManager(
+                self.vllm_config, self.device, cudagraph_mode, self.merged_rows
             )
 
     def capture(self) -> None:
@@ -260,6 +414,18 @@ class MTPBlockSpeculator(MTPSpeculator):
                 self.attn_groups,
                 self.kv_cache_config,
                 progress_bar_desc="Capturing MTP position-1 CUDA graphs",
+            )
+        if self.use_merged_pass:
+            assert self.merged_cudagraph_manager is not None
+            assert self.merged_slot_mappings is not None
+            self.merged_cudagraph_manager.capture(
+                self._merged_pass,
+                self.model_state,
+                self.input_buffers,
+                _PrivateSlotBlockTables(self.block_tables, self.merged_slot_mappings),
+                self.merged_attn_groups,
+                self.kv_cache_config,
+                progress_bar_desc="Capturing MTP merged-pass CUDA graphs",
             )
 
     def _prefill(
@@ -353,6 +519,46 @@ class MTPBlockSpeculator(MTPSpeculator):
         # Row 2 of the block is the dense row that drafts position 1.
         self.block_mixed.index_copy_(0, anchor_rows + 2, sample_hidden_states)
 
+    @torch.inference_mode()
+    def _merged_pass(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            num_tokens_across_dp=num_tokens_across_dp,
+            slot_mapping=slot_mappings,
+            batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
+        ):
+            input_ids = self.merged_input_ids[:num_tokens]
+            sample_hidden_states, multi_hidden_states = self.model(
+                input_ids=None,
+                positions=self.input_buffers.positions[:num_tokens],
+                hidden_states=self.merged_hidden_states[:num_tokens],
+                inputs_embeds=self.head.mtp_input_embeds(
+                    self.model.embed_input_ids, input_ids
+                ),
+                mask_rows=input_ids == self.mask_token_id,
+                mask_hidden_states=self.head.mtp_head.no_hidden,
+            )
+        # The anchor and its K mask rows are the block pass's rows.
+        num_reqs = num_tokens // self.merged_rows
+        anchors = self.merged_anchors[:num_reqs]
+        window = (anchors[:, None] + self.block_offsets).flatten()
+        self.block_mixed[: num_reqs * self.num_block_rows].copy_(
+            sample_hidden_states[window]
+        )
+        if self.use_pos1_pass:
+            self.anchor_multi_hidden[:num_reqs].copy_(multi_hidden_states[anchors])
+
     def root_candidates(self, num_reqs: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Top-k ids and logits of the first draft position (the anchor row)."""
         if self.use_pos1_pass:
@@ -372,6 +578,10 @@ class MTPBlockSpeculator(MTPSpeculator):
         if self.use_pos1_pass:
             self._prepare_eplb_forward(num_reqs)
             self._pos1_pass(num_reqs, num_reqs, None, None, None)
+        if self.use_merged_pass:
+            num_tokens = num_reqs * self.merged_rows
+            self._prepare_eplb_forward(num_tokens)
+            self._merged_pass(num_reqs, num_tokens, None, None, None)
 
     def _dispatch(
         self,
@@ -410,6 +620,7 @@ class MTPBlockSpeculator(MTPSpeculator):
         num_rows_per_req: int,
         dp_sync_state: DPSyncState | None,
         is_profile: bool,
+        attn_groups: list[list[AttentionGroup]] | None = None,
     ) -> None:
         """Run one pass over ``num_rows_per_req`` rows per request whose
         positions, seq_lens and query_start_loc are in ``self.input_buffers``."""
@@ -438,6 +649,7 @@ class MTPBlockSpeculator(MTPSpeculator):
             seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
             step=self.num_block_rows - 1,
             slot_mappings=private_slot_mappings[:, :num_attn_tokens],
+            attn_groups=attn_groups,
         )
         slot_mappings_by_layer = build_slot_mappings_by_layer(
             private_slot_mappings[:, :num_tokens_padded], self.kv_cache_config
@@ -498,6 +710,70 @@ class MTPBlockSpeculator(MTPSpeculator):
         )
 
     @torch.inference_mode()
+    def propose_merged(
+        self,
+        input_batch: InputBatch,
+        target_multi_hidden_states: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        is_profile: bool,
+    ) -> None:
+        """The draft prefill and the block pass as one forward, for a
+        decode-only batch on one DP rank. Every request's 1 + 2K rows fit the
+        slots the scheduler allocated: its K + 1 verification rows and the
+        head's K + 1 lookahead slots."""
+        assert self.merged_slot_mappings is not None
+        num_reqs = input_batch.num_reqs
+        self._copy_request_inputs(
+            num_reqs, input_batch.idx_mapping, temperature, seeds, dummy_run=False
+        )
+        _merged_inputs_kernel[(num_reqs, self.num_block_rows)](
+            self.merged_input_ids,
+            self.input_buffers.positions,
+            self.merged_hidden_states,
+            self.input_buffers.seq_lens,
+            self.merged_anchors,
+            input_batch.input_ids,
+            input_batch.positions,
+            target_multi_hidden_states,
+            target_multi_hidden_states.stride(0),
+            input_batch.query_start_loc,
+            input_batch.idx_mapping,
+            last_sampled,
+            next_prefill_tokens,
+            num_sampled,
+            num_rejected,
+            self.mask_token_id,
+            self.merged_rows,
+            self.max_num_reqs,
+            self.hidden_size,
+            BLOCK=32,
+            HIDDEN_BLOCK=2048,
+        )
+        self.input_buffers.query_start_loc.copy_(self.query_start_loc_merged)
+        self.input_buffers.query_start_loc[num_reqs + 1 :].fill_(
+            num_reqs * self.merged_rows
+        )
+        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        self.draft_max_seq_len = min(
+            max_seq_len + self.num_block_rows, self.max_model_len
+        )
+        self._run_pass(
+            self._merged_pass,
+            self.merged_cudagraph_manager,
+            self.merged_slot_mappings,
+            input_batch,
+            self.merged_rows,
+            None,
+            is_profile,
+            attn_groups=self.merged_attn_groups,
+        )
+
+    @torch.inference_mode()
     def propose_pos1(
         self,
         input_batch: InputBatch,
@@ -549,6 +825,8 @@ class DFlash2MTPSpeculator(DFlash2Speculator):
             use_pos1_pass=self.pos1_source is not None,
             varlen_prefill=self.enable_adaptive_verification,
         )
+        # Whether this step's MTP layer ran the merged pass.
+        self._merged_step = False
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -644,26 +922,42 @@ class DFlash2MTPSpeculator(DFlash2Speculator):
     ) -> torch.Tensor:
         if not aux_hidden_states:
             raise RuntimeError("DFlash2MTPDraftModel needs the target's aux states")
-        # The MTP prefill runs on the target's attention metadata and slot
-        # mappings, before the head lays out its query block.
-        self.mtp.propose(
-            input_batch,
-            attn_metadata,
-            slot_mappings,
-            last_hidden_states,
-            None,
-            num_sampled,
-            num_rejected,
-            last_sampled,
-            next_prefill_tokens,
-            temperature,
-            seeds,
-            dp_sync_state=dp_sync_state,
-            dummy_run=dummy_run,
-            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-            mm_inputs=mm_inputs,
-            is_profile=is_profile,
+        self._merged_step = (
+            self.mtp.use_merged_pass
+            and not dummy_run
+            and not input_batch.has_prefill
+            and self.dp_size == 1
         )
+        if self._merged_step:
+            self.mtp.propose_merged(
+                input_batch,
+                last_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                is_profile,
+            )
+        else:
+            self._propose_mtp_prefill(
+                input_batch,
+                attn_metadata,
+                slot_mappings,
+                last_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                dp_sync_state,
+                dummy_run,
+                skip_attn_for_dummy_run,
+                mm_inputs,
+                is_profile,
+            )
         return super().propose(
             input_batch,
             attn_metadata,
@@ -684,6 +978,45 @@ class DFlash2MTPSpeculator(DFlash2Speculator):
             num_speculative_tokens=num_speculative_tokens,
         )
 
+    def _propose_mtp_prefill(
+        self,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        last_hidden_states: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        dp_sync_state: DPSyncState | None,
+        dummy_run: bool,
+        skip_attn_for_dummy_run: bool,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+        is_profile: bool,
+    ) -> None:
+        # The MTP prefill runs on the target's attention metadata and slot
+        # mappings, before the head lays out its query block.
+        self.mtp.propose(
+            input_batch,
+            attn_metadata,
+            slot_mappings,
+            last_hidden_states,
+            None,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            temperature,
+            seeds,
+            dp_sync_state=dp_sync_state,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            mm_inputs=mm_inputs,
+            is_profile=is_profile,
+        )
+
     def run_query_passes(
         self,
         input_batch: InputBatch,
@@ -696,9 +1029,10 @@ class DFlash2MTPSpeculator(DFlash2Speculator):
         if skip_attn:
             self.mtp.run_dummy_passes(input_batch.num_reqs)
             return
-        self.mtp.propose_block(
-            input_batch, last_hidden_states, dp_sync_state, is_profile
-        )
+        if not self._merged_step:
+            self.mtp.propose_block(
+                input_batch, last_hidden_states, dp_sync_state, is_profile
+            )
         if self.pos1_source is not None:
             self.mtp.propose_pos1(input_batch, dp_sync_state, is_profile)
 

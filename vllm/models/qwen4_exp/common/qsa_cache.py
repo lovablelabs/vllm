@@ -573,6 +573,20 @@ build_qsa_metadata = (
 )
 
 
+def qsa_rows_per_step(vllm_config: VllmConfig) -> int:
+    """Rows one forward writes to a request's QSA caches before acceptance is
+    known: the verification rows, or the 1 + 2K rows of the merged MTP pass of
+    a DFlash2 head that drafts through the MTP layer."""
+    num_spec = vllm_config.num_speculative_tokens
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    draft_model_config = None if spec_config is None else spec_config.draft_model_config
+    if draft_model_config is not None and "DFlash2MTPDraftModel" in (
+        draft_model_config.architectures or []
+    ):
+        return 1 + 2 * num_spec
+    return 1 + num_spec
+
+
 @dataclass
 class QSAForwardMetadata(AttentionMetadata):
     """Common per-forward metadata for one QSA side cache."""
@@ -881,8 +895,14 @@ class QSAKeyStateCache(_QSAStateCache):
         # the ring divides the attention block size (it joins the LCM that sets
         # the scheduler block size). Anything narrower lets a rejected draft row
         # overwrite a committed key the next step needs to close the group.
-        span = self.compress_ratio + vllm_config.num_speculative_tokens
+        span = self.compress_ratio + qsa_rows_per_step(vllm_config) - 1
         capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
+        if qsa_rows_per_step(vllm_config) > 1 + vllm_config.num_speculative_tokens:
+            # A wider drafter forward: the smallest whole-group ring that holds
+            # it and still divides the attention block size.
+            block_size = self.cache_config.block_size
+            while capacity < block_size and block_size % capacity:
+                capacity += self.compress_ratio
         assert self.cache_config.block_size % capacity == 0, (
             f"QSA ring capacity {capacity} must divide the attention block "
             f"size {self.cache_config.block_size}"
