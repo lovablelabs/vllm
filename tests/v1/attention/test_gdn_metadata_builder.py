@@ -292,15 +292,22 @@ def test_spec_token_prefix(
     expected_prefix: int,
 ):
     """A mixed batch reports a speculative token prefix only when every
-    speculative request precedes every prefill, matching spec_token_indx."""
+    speculative request precedes every prefill; the spec and non-spec token
+    indices are then the contiguous ranges around it."""
     builder = _create_gdn_builder(num_speculative_tokens=3)
     batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
     meta = _build(builder, batch, num_decode_draft_tokens=draft_tokens)
 
     assert meta.spec_token_prefix == expected_prefix
     if expected_prefix:
+        # The GDN layers take row slices for these: spec rows [0, prefix),
+        # then every other row in order.
         assert meta.spec_token_indx is not None
         assert meta.spec_token_indx.tolist() == list(range(expected_prefix))
+        assert meta.non_spec_token_indx is not None
+        assert meta.non_spec_token_indx.tolist() == list(
+            range(expected_prefix, sum(query_lens))
+        )
 
 
 def test_full_cudagraph_spec_metadata_uses_request_count():

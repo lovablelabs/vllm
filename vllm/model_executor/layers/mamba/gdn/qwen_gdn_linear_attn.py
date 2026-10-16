@@ -1417,12 +1417,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
 
+        # Speculative requests leading a mixed batch (the scheduler's order):
+        # their rows are [0, spec_prefix) and the non-speculative rows follow,
+        # so row slices replace the gathers and scatters below.
+        spec_prefix = attn_metadata.spec_token_prefix
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
                 a_spec = a
                 b_spec = b
                 mixed_qkv_non_spec = None
+            elif spec_prefix > 0:
+                mixed_qkv_spec = mixed_qkv[:spec_prefix]
+                a_spec = a[:spec_prefix]
+                b_spec = b[:spec_prefix]
+                mixed_qkv_non_spec = mixed_qkv[spec_prefix:]
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 a_spec = a.index_select(0, spec_token_indx)
@@ -1499,7 +1508,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
-            if spec_sequence_masks is not None:
+            if spec_sequence_masks is not None and spec_prefix > 0:
+                a_non_spec = a[spec_prefix:]
+                b_non_spec = b[spec_prefix:]
+            elif spec_sequence_masks is not None:
                 a_non_spec = a.index_select(0, non_spec_token_indx)
                 b_non_spec = b.index_select(0, non_spec_token_indx)
             else:
@@ -1549,7 +1561,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_output_gate is not None:
-            spec_prefix = attn_metadata.spec_token_prefix
             assert spec_sequence_masks is not None and spec_prefix > 0
             assert attn_metadata.num_prefills > 0 and attn_metadata.num_decodes == 0
             self._forward_core_decode_spec_post_conv_fused_norm(
@@ -1678,10 +1689,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[start : start + non_spec_out.size(0)] = non_spec_out
         elif spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             assert core_attn_out_spec is not None
-            core_attn_out.index_copy_(0, spec_token_indx, core_attn_out_spec.squeeze(0))
-            core_attn_out.index_copy_(
-                0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
-            )
+            if spec_prefix > 0:
+                core_attn_out[:spec_prefix] = core_attn_out_spec.squeeze(0)
+                core_attn_out[spec_prefix:num_actual_tokens] = (
+                    core_attn_out_non_spec.squeeze(0)
+                )
+            else:
+                core_attn_out.index_copy_(
+                    0, spec_token_indx, core_attn_out_spec.squeeze(0)
+                )
+                core_attn_out.index_copy_(
+                    0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
+                )
         elif spec_sequence_masks is not None:
             assert core_attn_out_spec is not None
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
