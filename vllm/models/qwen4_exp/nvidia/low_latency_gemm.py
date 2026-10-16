@@ -165,6 +165,85 @@ QWEN4_EXP_SM100_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] =
     (62080, 2560): {
         1: SkinnyGemmConfig(1, 128, 2, k_unroll=4, vector_width=4),
     },
+    # QSA fused QKV/gate + replicated indexer Q/K, TP=2.
+    (7296, 2560): {
+        1: SkinnyGemmConfig(1, 128, 2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 2, vector_width=4, static_k=2560),
+    },
+    # GDN fused QKVZ projection, TP=2.
+    (8192, 2560): {
+        1: SkinnyGemmConfig(1, 128, 2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 2, vector_width=4, static_k=2560),
+    },
+    # GDN fused B/A projection, TP=2.
+    (48, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 1, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 1, vector_width=4, static_k=2560),
+        5: SkinnyGemmConfig(5, 128, 1, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
+        10: SkinnyGemmConfig(10, 128, 1, vector_width=4, static_k=2560),
+        16: SkinnyGemmConfig(16, 128, 1, vector_width=4, static_k=2560),
+    },
+    # GDN and QSA output projections, TP=2.
+    (2560, 3072): {
+        1: SkinnyGemmConfig(1, 128, 2, k_unroll=2),
+        2: SkinnyGemmConfig(2, 128, 2),
+        4: SkinnyGemmConfig(4, 32, 2, vector_width=4, static_k=3072),
+        5: SkinnyGemmConfig(5, 128, 2),
+    },
+    # PLE fused key/value projection, TP=2.
+    (12800, 2560): {
+        1: SkinnyGemmConfig(1, 128, 2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 32, 4, k_unroll=2, vector_width=4),
+    },
+    # MTP embedding and hidden projections, TP=2.
+    (1280, 2560): {
+        1: SkinnyGemmConfig(1, 64, 2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 64, 2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 64, 2, vector_width=4, static_k=2560),
+        5: SkinnyGemmConfig(5, 64, 2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 64, 2, vector_width=4, static_k=2560),
+    },
+    # Shared-expert fused gate/up projection, TP=2.
+    (640, 2560): {
+        1: SkinnyGemmConfig(1, 64, 2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 64, 1, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 64, 1, vector_width=4, static_k=2560),
+        5: SkinnyGemmConfig(5, 64, 1, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
+        10: SkinnyGemmConfig(10, 64, 2, vector_width=4, static_k=2560),
+        15: SkinnyGemmConfig(15, 64, 1, k_unroll=2),
+        16: SkinnyGemmConfig(16, 64, 2, vector_width=4, static_k=2560),
+    },
+    # Router.
+    (512, 2560): {
+        1: SkinnyGemmConfig(1, 64, 1, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 64, 1, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 64, 1, vector_width=4, static_k=2560),
+        5: SkinnyGemmConfig(5, 64, 1, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 64, 1, vector_width=4, static_k=2560),
+        10: SkinnyGemmConfig(10, 64, 1, vector_width=4, static_k=2560),
+        15: SkinnyGemmConfig(15, 64, 1, vector_width=4, static_k=2560),
+        16: SkinnyGemmConfig(16, 64, 1, vector_width=4, static_k=2560),
+    },
+    # Shared-expert down projection, TP=2.
+    (2560, 320): {
+        1: SkinnyGemmConfig(1, 32, 4, vector_width=2, static_k=320),
+        2: SkinnyGemmConfig(2, 32, 4, vector_width=2, static_k=320),
+    },
+    # Shared-expert gate.
+    (1, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 1, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 1, vector_width=4, static_k=2560),
+        5: SkinnyGemmConfig(5, 128, 1, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
+        10: SkinnyGemmConfig(10, 128, 1, vector_width=4, static_k=2560),
+        15: SkinnyGemmConfig(15, 128, 1, vector_width=4, static_k=2560),
+        16: SkinnyGemmConfig(16, 128, 1, vector_width=4, static_k=2560),
+    },
 }
 
 
