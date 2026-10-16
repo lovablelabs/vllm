@@ -469,11 +469,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return super().all_gather(input_, dim)
 
         input_size = input_.size()
-        output_size = (input_size[0] * self.world_size,) + input_size[1:]
-        output_tensor = torch.empty(
-            output_size, dtype=input_.dtype, device=input_.device
-        )
-        pynccl_comm.all_gather(output_tensor, input_.contiguous())
+        # The one-shot IPC kernel beats NCCL's ring for the small gathers that
+        # fit its staging buffer (decode-size gather_output projections,
+        # vocab-parallel top-k); it returns None for anything else.
+        output_tensor = self.custom_all_gather(input_)
+        if output_tensor is None:
+            output_size = (input_size[0] * self.world_size,) + input_size[1:]
+            output_tensor = torch.empty(
+                output_size, dtype=input_.dtype, device=input_.device
+            )
+            pynccl_comm.all_gather(output_tensor, input_.contiguous())
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         return output_tensor.reshape(

@@ -124,6 +124,18 @@ def all_gather_test_worker(
         t = tensor_model_parallel_all_gather(t, all_gather_dimension)
         torch.testing.assert_close(t, expected)
 
+    # Decode-size bf16 gathers take the custom IPC all-gather when it is
+    # available; integer inputs fall back to NCCL. Both must match a concat.
+    for dtype in (torch.bfloat16, torch.int32):
+        all_tensors = [
+            torch.arange(8 * 2560, device="cuda").reshape(8, 2560).to(dtype) + r
+            for r in range(tp_size)
+        ]
+        for dim in (0, -1):
+            expected = torch.cat(all_tensors, dim=dim)
+            t = tensor_model_parallel_all_gather(all_tensors[rank % tp_size], dim)
+            torch.testing.assert_close(t, expected)
+
 
 @ray.remote(num_gpus=1, max_calls=1)
 def broadcast_tensor_dict_test_worker(
