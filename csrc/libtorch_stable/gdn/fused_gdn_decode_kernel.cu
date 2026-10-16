@@ -217,10 +217,13 @@ __device__ __forceinline__ void store_row_slice<float>(float* dst,
   }
 }
 
+// RowsPerThread: each thread walks that many value rows, kChunkV apart, with the
+// same K slice; every shared-memory read of q and k then serves all of them
+// (one group only). Each row's arithmetic is the one-row walk's.
 template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate,
-          int Groups>
+          int Groups, int RowsPerThread, int MinBlocks>
 __global__
-__launch_bounds__(kGroupThreads* Groups, 4 / Groups) void gdn_decode_post_conv_mtp_kernel(
+__launch_bounds__(kGroupThreads* Groups, MinBlocks) void gdn_decode_post_conv_mtp_kernel(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
     const float* __restrict__ a_log, const void* __restrict__ dt_bias,
@@ -288,9 +291,16 @@ __launch_bounds__(kGroupThreads* Groups, 4 / Groups) void gdn_decode_post_conv_m
   const StateT* source_state =
       state + static_cast<int64_t>(source_slot) * strides.state_slot +
       head_offset;
-  RowSliceVectors<StateT> next_rows;
-  next_rows.load(source_state + (group * kChunkV + row) * kDimK +
-                 slice * kKPerThread);
+  static_assert(RowsPerThread == 1 || Groups == 1,
+                "several rows per thread walk the chunks in one group");
+  constexpr int kChunkStep = Groups * RowsPerThread;
+  RowSliceVectors<StateT> next_rows[RowsPerThread];
+#pragma unroll
+  for (int r = 0; r < RowsPerThread; ++r) {
+    next_rows[r].load(source_state +
+                      ((group * RowsPerThread + r) * kChunkV + row) * kDimK +
+                      slice * kKPerThread);
+  }
   float gate_inputs[4];
 
   if (warp < num_tokens) {
@@ -346,44 +356,75 @@ __launch_bounds__(kGroupThreads* Groups, 4 / Groups) void gdn_decode_post_conv_m
   __syncthreads();
 
 #pragma unroll 1
-  for (int chunk = group; chunk < kNumChunks; chunk += Groups) {
-    const int value = chunk * kChunkV + row;
-    const int64_t row_offset = value * kDimK + slice * kKPerThread;
-    float h[kKPerThread];
-    next_rows.unpack(h);
-    if (chunk + Groups < kNumChunks) {
-      next_rows.load(source_state + row_offset + Groups * kChunkV * kDimK);
+  for (int chunk = group * RowsPerThread; chunk < kNumChunks;
+       chunk += kChunkStep) {
+    int value[RowsPerThread];
+    int64_t row_offset[RowsPerThread];
+    float h[RowsPerThread][kKPerThread];
+#pragma unroll
+    for (int r = 0; r < RowsPerThread; ++r) {
+      value[r] = (chunk + r) * kChunkV + row;
+      row_offset[r] = value[r] * kDimK + slice * kKPerThread;
+      next_rows[r].unpack(h[r]);
+    }
+    if (chunk + kChunkStep < kNumChunks) {
+#pragma unroll
+      for (int r = 0; r < RowsPerThread; ++r) {
+        next_rows[r].load(source_state + row_offset[r] +
+                          kChunkStep * kChunkV * kDimK);
+      }
     }
     for (int t = 0; t < num_tokens; ++t) {
       const float decay = shared_decay[t];
       const float* k_slice = &shared_k[t][slice * kSlicePad];
       const float* q_slice = &shared_q[t][slice * kSlicePad];
-      float hk = 0.0f;
+      float hk[RowsPerThread];
+#pragma unroll
+      for (int r = 0; r < RowsPerThread; ++r) {
+        hk[r] = 0.0f;
+      }
 #pragma unroll
       for (int i = 0; i < kKPerThread; ++i) {
-        h[i] *= decay;
-        hk += h[i] * k_slice[i];
+        const float key = k_slice[i];
+#pragma unroll
+        for (int r = 0; r < RowsPerThread; ++r) {
+          h[r][i] *= decay;
+          hk[r] += h[r][i] * key;
+        }
       }
-      hk = row_reduce_sum(hk);
-      const float delta =
-          (__bfloat162float(shared_v[t][value]) - hk) * shared_beta[t];
-      float hq = 0.0f;
+      float delta[RowsPerThread];
+      float hq[RowsPerThread];
+#pragma unroll
+      for (int r = 0; r < RowsPerThread; ++r) {
+        hk[r] = row_reduce_sum(hk[r]);
+        delta[r] =
+            (__bfloat162float(shared_v[t][value[r]]) - hk[r]) * shared_beta[t];
+        hq[r] = 0.0f;
+      }
 #pragma unroll
       for (int i = 0; i < kKPerThread; ++i) {
-        h[i] += k_slice[i] * delta;
-        hq += h[i] * q_slice[i];
-      }
-      hq = row_reduce_sum(hq);
-      if (slice == 0) {
-        shared_out[t][value] = __float2bfloat16(hq);
+        const float key = k_slice[i];
+        const float query = q_slice[i];
+#pragma unroll
+        for (int r = 0; r < RowsPerThread; ++r) {
+          h[r][i] += key * delta[r];
+          hq[r] += h[r][i] * query;
+        }
       }
       const int destination_slot = shared_slots[t];
-      if (destination_slot > 0) {
-        store_row_slice<StateT>(
-            state +
-                static_cast<int64_t>(destination_slot) * strides.state_slot +
-                head_offset + row_offset,
-            h);
+#pragma unroll
+      for (int r = 0; r < RowsPerThread; ++r) {
+        hq[r] = row_reduce_sum(hq[r]);
+        if (slice == 0) {
+          shared_out[t][value[r]] = __float2bfloat16(hq[r]);
+        }
+        if (destination_slot > 0) {
+          store_row_slice<StateT>(
+              state +
+                  static_cast<int64_t>(destination_slot) * strides.state_slot +
+                  head_offset + row_offset[r],
+              h[r]);
+        }
       }
     }
   }
@@ -444,13 +485,13 @@ void launch_gdn_decode_post_conv_mtp(
   const cudaStream_t stream =
       get_current_cuda_stream(mixed_qkv.get_device_index());
   const int num_requests = static_cast<int>(state_indices.size(0));
-  const auto launch = [&]<int Groups>() {
+  const auto launch = [&]<int Groups, int RowsPerThread, int MinBlocks>() {
     // Ordering pays off only where blocks outnumber the SMs (one group).
     const bool ordered = Groups == 1 && longest_first;
     const dim3 grid = ordered ? dim3(num_value_heads, num_requests)
                               : dim3(num_requests, num_value_heads);
     gdn_decode_post_conv_mtp_kernel<StateT, ValueHeadsPerKeyHead, SigmoidGate,
-                                    Groups>
+                                    Groups, RowsPerThread, MinBlocks>
         <<<grid, kGroupThreads * Groups, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr()), a, b,
             static_cast<const float*>(a_log.data_ptr()), dt_bias.data_ptr(),
@@ -467,11 +508,17 @@ void launch_gdn_decode_post_conv_mtp(
   };
   // Up to about one block per SM, a head's four chunks run side by side
   // (B200, 1-4 requests x 24 heads: 0.74-0.78x the time of walking them in
-  // turn); beyond that, 256-thread blocks walk them in turn.
-  if (static_cast<int64_t>(num_requests) * num_value_heads <= 148) {
-    launch.template operator()<4>();
+  // turn); beyond that, 256-thread blocks walk them in turn, two value rows per
+  // thread so each shared-memory read of q and k serves both (B200, 8-64
+  // requests x 24 heads: 0.86-0.97x the one-row walk), two blocks per SM up to
+  // two blocks per SM's worth and three above.
+  const int64_t blocks = static_cast<int64_t>(num_requests) * num_value_heads;
+  if (blocks <= 148) {
+    launch.template operator()<4, 1, 1>();
+  } else if (blocks <= 2 * 148) {
+    launch.template operator()<1, 2, 2>();
   } else {
-    launch.template operator()<1>();
+    launch.template operator()<1, 2, 3>();
   }
   const cudaError_t error = cudaGetLastError();
   STD_TORCH_CHECK(error == cudaSuccess,
