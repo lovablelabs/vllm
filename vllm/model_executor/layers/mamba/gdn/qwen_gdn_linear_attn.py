@@ -40,6 +40,10 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_state_pool import (
+    fi_chunk_gated_delta_rule_pool,
+    pool_mode_supported,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -1342,6 +1346,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
 
+    def _prefill_in_state_pool(self, ssm_state: torch.Tensor) -> bool:
+        """Whether prefill runs FlashInfer's SM100 state-pool mode on this
+        layer's cache (FlashInfer backend, cache rows it can address in place).
+        Decided once per layer."""
+        use_pool = getattr(self, "_use_state_pool", None)
+        if use_pool is None:
+            use_pool = (
+                self.chunk_gated_delta_rule.gdn_prefill_backend == "flashinfer"
+                and current_platform.is_device_capability_family(100)
+                and pool_mode_supported(ssm_state)
+            )
+            self._use_state_pool = use_pool
+        return use_pool
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -1630,27 +1648,46 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=attn_metadata.prefill_query_start_loc,
-                chunk_indices=attn_metadata.chunk_indices,
-                chunk_offsets=attn_metadata.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-                aiter_prefill_metadata=attn_metadata.aiter_prefill_metadata,
-            )
-            # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if self._prefill_in_state_pool(ssm_state):
+                # FlashInfer reads and writes the rows' states in the cache in
+                # place: no gather, fp32 round trip or scatter, and no host sync
+                # for the new rows (bit-identical to the path below).
+                core_attn_out_non_spec = fi_chunk_gated_delta_rule_pool(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    ssm_state,
+                    prefill_state_indices,
+                    prefill_has_initial_state,
+                    attn_metadata.prefill_query_start_loc,
+                    use_qk_l2norm_in_kernel=False,
+                )
+            else:
+                initial_state = ssm_state[prefill_state_indices]
+                initial_state[~prefill_has_initial_state, ...] = 0
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=attn_metadata.prefill_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                    aiter_prefill_metadata=attn_metadata.aiter_prefill_metadata,
+                )
+                # Init cache
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill

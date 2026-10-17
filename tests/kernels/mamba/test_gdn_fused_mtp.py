@@ -127,6 +127,7 @@ def _build_layer(
     for name in (
         "rearrange_mixed_qkv",
         "_forward_core",
+        "_prefill_in_state_pool",
         "_forward_core_decode_spec_post_conv_fused_norm",
         "_forward_core_decode_spec_fused_norm",
         "_can_use_fused_gdn_mtp_decode",
