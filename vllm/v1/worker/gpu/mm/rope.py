@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import cast
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -69,7 +70,9 @@ class RopeState:
         self.prefill_delta.np[req_idx] = delta
 
         for i in range(self.num_dims):
-            pos = prefill_positions[i].tolist()
+            # Stage as an array: .tolist() of a 42k-token prompt's positions
+            # costs milliseconds per new request.
+            pos = np.asarray(prefill_positions[i])
             self.prefill_positions.stage_write(self.num_dims * req_idx + i, 0, pos)
 
     def apply_staged_writes(self) -> None:

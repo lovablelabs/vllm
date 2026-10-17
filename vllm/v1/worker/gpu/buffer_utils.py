@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import array
 from collections.abc import Iterable, Sequence
 from functools import partial
 
@@ -15,6 +16,36 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+_NP_DTYPES = {torch.int32: np.int32, torch.int64: np.int64, torch.float32: np.float32}
+
+
+# array.array codes with the same item layout as these dtypes: building a long
+# Python list (a new request's ~40k prompt token ids) through array.array is
+# ~1.4x faster than np.asarray, with the same values.
+_ARRAY_CODES = {
+    np.dtype(code_dtype): code
+    for code, code_dtype in (("i", np.int32), ("q", np.int64), ("f", np.float32))
+    if array.array(code).itemsize == np.dtype(code_dtype).itemsize
+}
+
+
+def _as_array(chunk, dtype) -> np.ndarray:
+    if type(chunk) is list and len(chunk) > 256:
+        code = _ARRAY_CODES.get(np.dtype(dtype))
+        if code is not None:
+            try:
+                return np.frombuffer(array.array(code, chunk), dtype=dtype)
+            except (TypeError, OverflowError):
+                pass  # e.g. floats for an int buffer: numpy's conversion rules
+    return np.asarray(chunk, dtype=dtype)
+
+
+def _concat_chunks(chunks: Sequence, dtype) -> np.ndarray:
+    if not chunks:
+        return np.empty(0, dtype=dtype)
+    return np.concatenate([_as_array(chunk, dtype) for chunk in chunks])
+
 
 # Default round-robin depth for the UVA buffer pools. Must be >= the number of
 # concurrent in-flight steps (engine batch_queue_size).
@@ -164,8 +195,15 @@ class StagedWriteTensor:
 
         self._staged_write_indices: list[int] = []
         self._staged_write_starts: list[int] = []
-        self._staged_write_contents: list[int | float] = []
+        # One chunk (list or ndarray) per staged write, concatenated with numpy
+        # when applied: a 42k-token prompt (or its M-RoPE positions) staged as
+        # Python ints cost milliseconds per new request.
+        self._staged_write_contents: list[np.ndarray | list[int | float]] = []
         self._staged_write_cu_lens: list[int] = []
+        self._staged_write_len = 0
+        self._np_dtype = (
+            _NP_DTYPES.get(dtype) or torch.empty(0, dtype=dtype).numpy().dtype
+        )
 
         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
 
@@ -179,19 +217,27 @@ class StagedWriteTensor:
     ) -> None:
         assert index >= 0
         assert start >= 0
-        if not x:
+        if not isinstance(x, np.ndarray):
+            x = list(x)
+        if len(x) == 0:
             return
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(start)
-        self._staged_write_contents.extend(x)
-        self._staged_write_cu_lens.append(len(self._staged_write_contents))
+        self._staged_write_contents.append(x)
+        self._staged_write_len += len(x)
+        self._staged_write_cu_lens.append(self._staged_write_len)
 
     def stage_write_elem(self, index: int, x: int) -> None:
         assert index >= 0
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(0)
-        self._staged_write_contents.append(x)
-        self._staged_write_cu_lens.append(len(self._staged_write_contents))
+        self._staged_write_contents.append([x])
+        self._staged_write_len += 1
+        self._staged_write_cu_lens.append(self._staged_write_len)
+
+    def staged_contents(self) -> np.ndarray:
+        """The staged writes' contents as one array, in staging order."""
+        return _concat_chunks(self._staged_write_contents, self._np_dtype)
 
     def apply_write(self) -> None:
         n = len(self._staged_write_indices)
@@ -202,14 +248,13 @@ class StagedWriteTensor:
         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
 
+        contents = self.staged_contents()
         if self.write_contents is None:
             write_contents = async_tensor_h2d(
-                self._staged_write_contents, device=self.device, dtype=self.dtype
+                contents, device=self.device, dtype=self.dtype
             )
         else:
-            write_contents = self.write_contents.copy_to_uva(
-                self._staged_write_contents
-            )
+            write_contents = self.write_contents.copy_to_uva(contents)
 
         # Write diffs to the GPU buffer
         _apply_write_kernel[(n,)](
@@ -231,6 +276,7 @@ class StagedWriteTensor:
         self._staged_write_starts.clear()
         self._staged_write_contents.clear()
         self._staged_write_cu_lens.clear()
+        self._staged_write_len = 0
 
 
 class FusedStagedWriter:
@@ -258,8 +304,9 @@ class FusedStagedWriter:
         group_ids: list[int] = []
         indices: list[int] = []
         starts: list[int] = []
-        contents: list[int | float] = []
+        chunks: list[np.ndarray | list[int | float]] = []
         cu_lens: list[int] = []
+        content_base = 0
 
         for group_id, t in enumerate(tensors):
             n = len(t._staged_write_indices)
@@ -269,9 +316,9 @@ class FusedStagedWriter:
             group_ids.extend([group_id] * n)
             indices.extend(t._staged_write_indices)
             starts.extend(t._staged_write_starts)
-            content_base = len(contents)
-            contents.extend(t._staged_write_contents)
+            chunks.extend(t._staged_write_contents)
             cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)
+            content_base += t._staged_write_len
 
         if not group_ids:
             return
@@ -280,7 +327,9 @@ class FusedStagedWriter:
         indices_uva = self.indices.copy_to_uva(indices)
         starts_uva = self.starts.copy_to_uva(starts)
         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
-        contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
+        contents_gpu = async_tensor_h2d(
+            _concat_chunks(chunks, np.int32), device=self.device, dtype=torch.int32
+        )
 
         _apply_write_kernel[(len(group_ids),)](
             output_ptrs,
