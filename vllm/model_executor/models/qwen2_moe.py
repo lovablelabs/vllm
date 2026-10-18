@@ -44,6 +44,10 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
 )
+from vllm.model_executor.layers.fused_moe.shared_expert_gate import (
+    can_fuse_shared_gate,
+    shared_gate_mul,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -85,6 +89,7 @@ class Qwen2MoeMLP(nn.Module):
         is_sequence_parallel: bool = False,
         disable_tp: bool = False,
         prefix: str = "",
+        fuse_expert_gate: bool = False,
     ) -> None:
         super().__init__()
         disable_tp = disable_tp or is_sequence_parallel
@@ -111,6 +116,9 @@ class Qwen2MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
+        # Compute sigmoid(expert_gate(x)) * out in one kernel (the expert gate
+        # must be an unquantized, bias-free [1, hidden] projection).
+        self.fuse_expert_gate = fuse_expert_gate
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -118,7 +126,16 @@ class Qwen2MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            weight = getattr(self.expert_gate, "weight", None)
+            if (
+                self.fuse_expert_gate
+                and weight is not None
+                and getattr(self.expert_gate, "bias", None) is None
+                and can_fuse_shared_gate(x, weight, out)
+            ):
+                out = shared_gate_mul(x, weight, out)
+            else:
+                out = F.sigmoid(self.expert_gate(x)[0]) * out
 
         return out
 

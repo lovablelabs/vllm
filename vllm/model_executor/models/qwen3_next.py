@@ -129,6 +129,9 @@ def _should_replicate_misaligned_shared_expert(
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
+    # Subclasses may compute the shared expert's sigmoid gate in one kernel.
+    fuse_shared_expert_gate: bool = False
+
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -213,6 +216,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 is_sequence_parallel=self.is_sequence_parallel,
                 disable_tp=self.replicate_shared_expert,
                 prefix=f"{prefix}.shared_expert",
+                fuse_expert_gate=self.fuse_shared_expert_gate,
             )
 
         self.experts = FusedMoEFactory(

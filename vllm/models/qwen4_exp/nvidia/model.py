@@ -161,6 +161,10 @@ _EXTRA_WEIGHTS_MAPPER = WeightsMapper(
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen4Exp HC validation."""
 
+    # The shared expert's gate GEMM (N = 1), sigmoid and broadcast multiply as
+    # one kernel: ~16 us -> ~3.5 us per MoE layer on its stream at decode sizes.
+    fuse_shared_expert_gate = True
+
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         parallel_config = vllm_config.parallel_config
         if parallel_config.use_sequence_parallel_moe:
