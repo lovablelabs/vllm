@@ -122,6 +122,91 @@ def _hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
     return output
 
 
+# Down projections past the fused CuTe-DSL range (cute_dsl/hc_down_silu.py)
+# and up to HC_DOWN_SLICED_MAX_TOKENS run as one batched GEMM over K slices
+# with fp32 partials, which _hc_down_silu_sliced_kernel sums and activates.
+# cuBLAS would otherwise pick a split-K GEMM and its reduce kernel at these
+# sizes, and hc_silu adds a third launch.
+HC_DOWN_SLICES = 8
+HC_DOWN_SLICED_MAX_TOKENS = 512
+
+
+@triton.jit
+def _hc_down_silu_sliced_kernel(
+    part_ptr,
+    y_ptr,
+    stride_part_slice,
+    stride_part_row,
+    stride_y,
+    SLICES: tl.constexpr,
+    RANK: tl.constexpr,
+    WIDTH: tl.constexpr,
+    HC: tl.constexpr,
+    launch_pdl: tl.constexpr,
+) -> None:
+    BLOCK_SIZE: tl.constexpr = triton.next_power_of_2(WIDTH)
+
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < WIDTH
+
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for s in tl.static_range(SLICES):
+        acc += tl.load(
+            part_ptr + s * stride_part_slice + row * stride_part_row + offs,
+            mask=mask,
+            other=0.0,
+        )
+    # Round as the unsliced GEMM's bf16 output does, then apply hc_silu to the
+    # low-rank columns; the injection logits stay plain.
+    down = acc.to(y_ptr.dtype.element_ty).to(tl.float32)
+    x = down / HC
+    y = tl.where(offs < RANK, x * tl.sigmoid(x), down)
+
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+    tl.store(y_ptr + row * stride_y + offs, y, mask)
+
+
+def _hc_down_silu_sliced(
+    x: torch.Tensor, weight: torch.Tensor, rank: int, hc_count: int
+) -> torch.Tensor:
+    """Return ``x @ weight.T`` for the merged down+inject weight [N, K].
+
+    The output is [M, N] bf16 with hc_silu applied to the first ``rank``
+    columns; the padding columns past rank + hc_count are left unwritten. The
+    padded row stride keeps the low-rank view aligned for the up projection's
+    GEMM (a 324-column stride sends cuBLAS to a slower sm80 kernel).
+    """
+    num_tokens, k = x.shape
+    n = weight.shape[0]
+    assert x.stride(1) == 1 and weight.is_contiguous()
+    assert k % HC_DOWN_SLICES == 0 and rank + hc_count <= n
+
+    slice_k = k // HC_DOWN_SLICES
+    x_slices = x.unflatten(1, (HC_DOWN_SLICES, slice_k)).transpose(0, 1)
+    w_slices = weight.view(n, HC_DOWN_SLICES, slice_k).permute(1, 2, 0)
+    partials = torch.bmm(x_slices, w_slices, out_dtype=torch.float32)
+
+    output = x.new_empty((num_tokens, n))
+    _hc_down_silu_sliced_kernel[(num_tokens,)](
+        partials,
+        output,
+        partials.stride(0),
+        partials.stride(1),
+        output.stride(0),
+        SLICES=HC_DOWN_SLICES,
+        RANK=rank,
+        WIDTH=rank + hc_count,
+        HC=hc_count,
+        launch_pdl=current_platform.is_arch_support_pdl(),
+    )
+    return output
+
+
 @triton.jit
 def _hc_gate_mix_kernel(
     x_ptr,
@@ -396,6 +481,12 @@ def _same_shape_fake(x: torch.Tensor, *args) -> torch.Tensor:
     return x.new_empty(x.shape)
 
 
+def _hc_down_silu_sliced_fake(
+    x: torch.Tensor, weight: torch.Tensor, rank: int, hc_count: int
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]))
+
+
 def _hc_gate_mix_fake(
     x: torch.Tensor, gate: torch.Tensor, hc_count: int
 ) -> torch.Tensor:
@@ -436,6 +527,11 @@ direct_register_custom_op(
     fake_impl=_same_shape_fake,
 )
 direct_register_custom_op(
+    op_name="qwen4_exp_hc_down_silu_sliced",
+    op_func=_hc_down_silu_sliced,
+    fake_impl=_hc_down_silu_sliced_fake,
+)
+direct_register_custom_op(
     op_name="qwen4_exp_hc_gate_mix",
     op_func=_hc_gate_mix,
     fake_impl=_hc_gate_mix_fake,
@@ -460,6 +556,15 @@ def grouped_gemma_rmsnorm(
 
 def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
     return torch.ops.vllm.qwen4_exp_hc_silu(x, hc_count)
+
+
+def hc_down_silu_sliced(
+    x: torch.Tensor, weight: torch.Tensor, rank: int, hc_count: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The HC down projection's activated low-rank columns [M, rank] and its
+    injection logits [M, hc_count], from the K-sliced GEMM."""
+    output = torch.ops.vllm.qwen4_exp_hc_down_silu_sliced(x, weight, rank, hc_count)
+    return output[:, :rank], output[:, rank : rank + hc_count]
 
 
 def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
@@ -496,9 +601,12 @@ def hc_combine_norm(
 
 
 __all__ = [
+    "HC_DOWN_SLICED_MAX_TOKENS",
+    "HC_DOWN_SLICES",
     "grouped_gemma_rmsnorm",
     "hc_combine",
     "hc_combine_norm",
+    "hc_down_silu_sliced",
     "hc_gate_mix",
     "hc_silu",
 ]

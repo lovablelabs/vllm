@@ -39,9 +39,12 @@ from ..common.hyperconnection import (
 )
 from .ops.cute_dsl.hc_down_silu import MAX_FUSED_M, hc_down_silu
 from .ops.hc import (
+    HC_DOWN_SLICED_MAX_TOKENS,
+    HC_DOWN_SLICES,
     grouped_gemma_rmsnorm,
     hc_combine,
     hc_combine_norm,
+    hc_down_silu_sliced,
     hc_gate_mix,
     hc_silu,
 )
@@ -141,18 +144,16 @@ class GatedResidual(nn.Module):
         if not self.use_combine:
             return hc_silu(self.input_mix_weight_down(xn), self.hc_count), None
 
-        use_fused = (
-            self._use_hc_down_silu
-            and not envs.VLLM_BATCH_INVARIANT
-            and 1 <= xn.shape[0] <= MAX_FUSED_M
-        )
-        if use_fused:
-            return hc_down_silu(
-                xn,
-                self.input_mix_weight_down_block_inject.weight,
-                self.lora_rank,
-                self.hc_count,
-            )
+        num_tokens = xn.shape[0]
+        weight = self.input_mix_weight_down_block_inject.weight
+        if self._use_hc_down_silu and not envs.VLLM_BATCH_INVARIANT:
+            if 1 <= num_tokens <= MAX_FUSED_M:
+                return hc_down_silu(xn, weight, self.lora_rank, self.hc_count)
+            if (
+                MAX_FUSED_M < num_tokens <= HC_DOWN_SLICED_MAX_TOKENS
+                and weight.shape[1] % HC_DOWN_SLICES == 0
+            ):
+                return hc_down_silu_sliced(xn, weight, self.lora_rank, self.hc_count)
         down_and_injection = self.input_mix_weight_down_block_inject(xn)
         split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
         lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)

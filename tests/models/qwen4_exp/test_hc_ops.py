@@ -9,6 +9,7 @@ from vllm.models.qwen4_exp.nvidia.ops.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
     hc_combine_norm,
+    hc_down_silu_sliced,
     hc_gate_mix,
     hc_silu,
 )
@@ -154,4 +155,27 @@ def test_hc_down_silu_fused(num_tokens: int) -> None:
     )
     torch.testing.assert_close(
         injection, down[:, LORA_RANK : LORA_RANK + HC], rtol=0.01, atol=0.01
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 49, 80, 512])
+def test_hc_down_silu_sliced(num_tokens: int) -> None:
+    # Compare with the unsliced bf16 GEMM + hc_silu path it replaces.
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(DOWN_N, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+
+    lora, injection = hc_down_silu_sliced(x, weight, LORA_RANK, HC)
+    # The views keep the padded weight's row stride, as the fused kernel's do:
+    # the up projection's GEMM needs the low-rank rows 16-byte aligned.
+    assert lora.stride(0) == injection.stride(0) == DOWN_N
+
+    # The slices sum in a different order than cuBLAS, which can move a
+    # bf16-rounded product by one ulp (0.8% relative).
+    down = x @ weight.t()
+    torch.testing.assert_close(
+        lora, hc_silu(down[:, :LORA_RANK], HC), rtol=0.02, atol=0.02
+    )
+    torch.testing.assert_close(
+        injection, down[:, LORA_RANK : LORA_RANK + HC], rtol=0.02, atol=0.02
     )
