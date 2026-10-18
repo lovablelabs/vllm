@@ -987,6 +987,12 @@ def test_qsa_block_expansion_correctness() -> None:
         pytest.param(128, 24, 2, 1568, True, 7, True, id="tp1_r128_fp8"),
         pytest.param(2048, 24, 2, 1600, True, 63, True, id="tp1_r2048_prefill_fp8"),
         pytest.param(2048, 24, 2, 1600, False, 63, True, id="tp1_r2048_uniform_fp8"),
+        # fp8 on the TP2 head split, across the sm_100 split-count regions.
+        pytest.param(16, 12, 1, 1776, False, 2, True, id="tp2_r16_fp8"),
+        pytest.param(80, 12, 1, 1776, False, 16, True, id="tp2_r80_fp8"),
+        pytest.param(160, 12, 1, 1776, False, 20, True, id="tp2_r160_fp8"),
+        pytest.param(384, 12, 1, 1776, False, 48, True, id="tp2_r384_fp8"),
+        pytest.param(1024, 12, 1, 1776, False, 128, True, id="tp2_r1024_fp8"),
     ],
 )
 def test_qsa_sparse_paged_attention_correctness(

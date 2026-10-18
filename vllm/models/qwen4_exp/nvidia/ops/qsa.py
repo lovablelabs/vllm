@@ -23,6 +23,12 @@ def _is_sm120() -> bool:
 
 
 @lru_cache(maxsize=1)
+def _is_sm100() -> bool:
+    """True on sm_100 (B200): selects the sm_100 fp8 tuning table."""
+    return current_platform.get_device_capability() == (10, 0)
+
+
+@lru_cache(maxsize=1)
 def _is_sm90() -> bool:
     """True on sm_90 (H100/H200/H20): selects the sm_90 tuning table."""
     return current_platform.get_device_capability() == (9, 0)
@@ -543,6 +549,33 @@ def _select_sm90_config(
     return 32, 4, 1
 
 
+def _select_sm100_fp8_config(
+    base_programs: int, use_prefill_config: bool
+) -> tuple[int, int, int]:
+    """(block_n, target_splits, num_warps) for fp8 caches, tuned on sm_100 (B200)
+    at the TP=2 head split. Single-warp programs over 32 columns win at every
+    size; the split count keeps roughly 1-3K programs in flight."""
+    if base_programs > 2048:
+        return (32, 1, 1) if use_prefill_config else (64, 1, 2)
+    if base_programs <= 8:
+        return 32, 64, 4
+    if base_programs <= 24:
+        return 32, 64, 1
+    if base_programs <= 32:
+        return 32, 32, 1
+    if base_programs <= 64:
+        return 32, 16, 1
+    if base_programs <= 128:
+        return 32, 8, 1
+    if base_programs <= 192:
+        return 32, 16, 1
+    if base_programs <= 256:
+        return 32, 4, 1
+    if base_programs <= 384:
+        return 32, 8, 1
+    return 32, 2, 1
+
+
 def _select_config(
     num_rows: int,
     num_kv_heads: int,
@@ -556,10 +589,15 @@ def _select_config(
     on use_prefill_config (capture-stable: at FULL-graph capture max_query_len is
     the uniform decode/verify length). This default table was tuned on GB300;
     sm_120 (RTX PRO 6000 Blackwell) dispatches to _select_sm120_config instead,
-    and sm_90 (Hopper) to _select_sm90_config.
+    sm_90 (Hopper) to _select_sm90_config and sm_100 (B200) fp8 caches to
+    _select_sm100_fp8_config.
     """
     base_programs = num_rows * num_kv_heads
-    if _is_sm120():
+    if _is_sm100() and is_fp8:
+        BLOCK_N, target_splits, num_warps = _select_sm100_fp8_config(
+            base_programs, use_prefill_config
+        )
+    elif _is_sm120():
         BLOCK_N, target_splits, num_warps = _select_sm120_config(
             base_programs, use_prefill_config, is_fp8
         )
