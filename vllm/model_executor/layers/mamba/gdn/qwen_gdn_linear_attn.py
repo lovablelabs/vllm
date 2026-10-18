@@ -29,6 +29,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
@@ -476,6 +477,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         prefix: str = "",
         gqa_interleaved_layout=False,
         reduce_results: bool = True,
+        merge_in_proj: bool = False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
@@ -535,6 +537,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+        self.in_proj_qkvzba: MergedColumnParallelLinear | None = None
+        if merge_in_proj:
+            self._merge_in_proj(prefix)
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -706,6 +711,49 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=prefix,
             disable_tp=self.maybe_disable_tp(quant_config),
         )
+
+    def _merge_in_proj(self, prefix: str) -> None:
+        """Replace in_proj_qkvz and in_proj_ba with one [q, k, v, z, b, a]
+        projection when both are unquantized, TP-sharded and in the flat
+        layout: the b/a projection is a few dozen columns per rank, which a GEMM
+        of its own runs as split-K plus a reduce kernel (CUDA forward only)."""
+        if not (
+            current_platform.is_cuda()
+            and not self.gqa_interleaved_layout
+            and not self.disable_tp_for_ba_proj
+            and isinstance(self.in_proj_qkvz.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.in_proj_ba.quant_method, UnquantizedLinearMethod)
+        ):
+            return
+        merged = MergedColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_sizes=[self.key_dim, self.key_dim, self.value_dim, self.value_dim]
+            + [self.num_v_heads] * 2,
+            bias=False,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.in_proj_qkvzba",
+        )
+        if not isinstance(merged.quant_method, UnquantizedLinearMethod):
+            return
+        del self.in_proj_qkvz, self.in_proj_ba
+        self.in_proj_qkvzba = merged
+        self._qkvz_ba_sizes = [
+            (self.key_dim + self.value_dim) * 2 // self.tp_size,
+            self.num_v_heads * 2 // self.tp_size,
+        ]
+
+    def _project_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The q/k/v/z and b/a input projections (views of one GEMM's output
+        when the layer merged them)."""
+        if getattr(self, "in_proj_qkvzba", None) is not None:
+            projected, _ = self.in_proj_qkvzba(hidden_states)
+            mixed_qkvz, ba = projected.split(self._qkvz_ba_sizes, dim=-1)
+            return mixed_qkvz, ba
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
+        return mixed_qkvz, ba
 
     def maybe_disable_tp(self, quant_config: QuantizationConfig | None) -> bool:
         """Whether to replicate ba_proj instead of TP-sharding it.
@@ -1001,8 +1049,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz, ba = self._project_input(hidden_states)
 
         use_fused_gdn_spec_decode = (
             self.enable_fused_gdn_spec_decode
@@ -1111,8 +1158,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         assert not hasattr(self, "in_proj_qkv"), "lora isn't supported on CPU."
 
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz, ba = self._project_input(hidden_states)
 
         if self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout

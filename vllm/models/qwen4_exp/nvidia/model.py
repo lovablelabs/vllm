@@ -156,6 +156,16 @@ _EXTRA_WEIGHTS_MAPPER = WeightsMapper(
         "ple.value_proj": ("ple.kv_proj", 1),
     }
 )
+# GDN layers that merged their input projections (merge_in_proj) load all four
+# checkpoint projections into one.
+_MERGED_GDN_IN_PROJ_MAPPER = WeightsMapper(
+    orig_to_new_stacked={
+        ".in_proj_qkv": (".in_proj_qkvzba", (0, 1, 2)),
+        ".in_proj_z": (".in_proj_qkvzba", 3),
+        ".in_proj_b": (".in_proj_qkvzba", 4),
+        ".in_proj_a": (".in_proj_qkvzba", 5),
+    }
+)
 
 
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
@@ -216,6 +226,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
+                merge_in_proj=True,
             )
         elif layer_type in _QSA_LAYER_TYPES:
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
@@ -597,6 +608,11 @@ class Qwen4ExpModel(nn.Module):
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={substr: None for substr in skip_substrs}
         )
+        if any(
+            getattr(module, "in_proj_qkvzba", None) is not None
+            for module in self.modules()
+        ):
+            mapper = mapper | _MERGED_GDN_IN_PROJ_MAPPER
         # The final HC mixer only exists on the last PP rank; earlier ranks
         # must drop its checkpoint weights instead of failing to place them.
         ignore_prefixes = (
@@ -630,6 +646,7 @@ class Qwen4ExpForCausalLM(
         "gate_up_proj": ["gate_proj", "up_proj"],
         "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_qkvzba": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
         "input_mix_weight_down_block_inject": [
             "input_mix_weight_down",
@@ -878,6 +895,7 @@ class Qwen4ExpForConditionalGeneration(
     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
         "qkv_proj": Qwen4ExpForCausalLM.packed_modules_mapping["qkv_proj"],
         "kv_proj": ["key_proj", "value_proj"],
+        "in_proj_qkvzba": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
         "input_mix_weight_down_block_inject": [
             "input_mix_weight_down",
             "block_inject_weight",

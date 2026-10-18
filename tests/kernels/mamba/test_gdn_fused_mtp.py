@@ -128,6 +128,7 @@ def _build_layer(
         "rearrange_mixed_qkv",
         "_forward_core",
         "_prefill_in_state_pool",
+        "_project_input",
         "_forward_core_decode_spec_post_conv_fused_norm",
         "_forward_core_decode_spec_fused_norm",
         "_can_use_fused_gdn_mtp_decode",
@@ -184,16 +185,20 @@ def test_fused_mtp_head_ratio_guard(num_v_heads: int, expected: bool) -> None:
     )
 
 
+@pytest.mark.parametrize("merged_in_proj", [False, True])
 @torch.inference_mode()
-def test_fused_forward_uses_packed_entrypoint() -> None:
-    """Fused mode keeps projected QKVZ and BA packed through the model op."""
+def test_fused_forward_uses_packed_entrypoint(merged_in_proj: bool) -> None:
+    """Fused mode keeps projected QKVZ and BA packed through the model op, from
+    separate projections or as views of the merged one."""
     device = torch.device("cuda")
     num_tokens = 3
     hidden_states = torch.empty(num_tokens, 1, dtype=torch.bfloat16, device=device)
-    mixed_qkvz = torch.randn(
-        num_tokens, CONV_DIM + HV * V, dtype=torch.bfloat16, device=device
+    qkvz_width = CONV_DIM + HV * V
+    projected = torch.randn(
+        num_tokens, qkvz_width + 2 * HV, dtype=torch.bfloat16, device=device
     )
-    ba = torch.randn(num_tokens, 2 * HV, dtype=torch.bfloat16, device=device)
+    mixed_qkvz = projected[:, :qkvz_width].clone()
+    ba = projected[:, qkvz_width:].clone()
     layer = types.SimpleNamespace(
         prefix=PREFIX,
         enable_fused_gdn_spec_decode=True,
@@ -205,11 +210,16 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
         head_v_dim=V,
         in_proj_qkvz=lambda _: (mixed_qkvz, None),
         in_proj_ba=lambda _: (ba, None),
+        in_proj_qkvzba=(lambda _: (projected, None)) if merged_in_proj else None,
+        _qkvz_ba_sizes=[qkvz_width, 2 * HV],
         out_proj=lambda x: (x, None),
     )
-    layer.forward_cuda = types.MethodType(
-        QwenGatedDeltaNetAttention.forward_cuda, layer
-    )
+    for name in ("forward_cuda", "_project_input"):
+        setattr(
+            layer,
+            name,
+            types.MethodType(getattr(QwenGatedDeltaNetAttention, name), layer),
+        )
 
     def packed_op(
         actual_qkvz: torch.Tensor,
@@ -218,8 +228,13 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
         *,
         layer_name: str,
     ) -> None:
-        assert actual_qkvz is mixed_qkvz
-        assert actual_ba is ba
+        if merged_in_proj:
+            assert actual_qkvz.data_ptr() == projected.data_ptr()
+            torch.testing.assert_close(actual_qkvz, mixed_qkvz, atol=0, rtol=0)
+            torch.testing.assert_close(actual_ba, ba, atol=0, rtol=0)
+        else:
+            assert actual_qkvz is mixed_qkvz
+            assert actual_ba is ba
         assert layer_name == _encode_layer_name(PREFIX)
         output.fill_(1)
 
