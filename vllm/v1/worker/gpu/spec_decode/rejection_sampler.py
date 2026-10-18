@@ -21,6 +21,9 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.spec_decode.greedy_vocab_parallel import (
+    greedy_verify_vocab_parallel,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -403,6 +406,72 @@ class RejectionSampler:
             else None
         )
         return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors
+
+    def can_verify_greedy_vocab_parallel(self, input_batch: InputBatch) -> bool:
+        """Whether every request of the batch is greedy with no logits processing
+        but min_tokens and no logprobs or sampling masks, so that
+        verify_greedy_vocab_parallel returns this sampler's tokens."""
+        sampler = self.sampler
+        return (
+            self.watermark_key is None
+            and self.synthetic_conditional_rates is None
+            and not self.use_block_verification
+            and not sampler.compute_nans
+            and not sampler.return_sampling_mask
+            and sampler.trace_replay_state is None
+            and bool(np.all(sampler.greedy_argmax_only[input_batch.idx_mapping_np]))
+            and sampler.sampling_states.max_num_logprobs(input_batch.idx_mapping_np)
+            == NO_LOGPROBS
+        )
+
+    def verify_greedy_vocab_parallel(
+        self,
+        local_logits: torch.Tensor,
+        input_batch: InputBatch,
+        vocab_start: int,
+        num_valid: int,
+        tp_size: int,
+    ) -> SamplerOutput:
+        """Verify an all-greedy batch (see can_verify_greedy_vocab_parallel) from
+        this rank's vocab shard of the target logits, whose first ``num_valid``
+        columns hold token ids ``vocab_start ..``."""
+        draft_sampled, pos = gather_draft_sampled(
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        logit_bias_state = self.sampler.logit_bias_state
+        sampled, num_sampled = greedy_verify_vocab_parallel(
+            local_logits,
+            num_valid,
+            vocab_start,
+            tp_size,
+            draft_sampled,
+            input_batch.cu_num_logits,
+            pos,
+            input_batch.expanded_idx_mapping,
+            logit_bias_state.min_lens.gpu,
+            logit_bias_state.num_stop_token_ids.gpu,
+            logit_bias_state.stop_token_ids.gpu,
+            self.num_speculative_steps,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def __call__(
         self,

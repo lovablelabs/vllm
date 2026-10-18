@@ -46,6 +46,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_ma
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload.inplace import reload_weights
 from vllm.model_executor.models.interfaces import requires_raw_input_tokens
@@ -334,6 +335,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
+        # (vocab_start, num_valid, tp_size) of this rank's lm_head shard when
+        # all-greedy speculative batches can verify from vocab-parallel logits.
+        self.greedy_vocab_shard: tuple[int, int, int] | None = None
         self.batch_sharder: BatchSharder | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -510,6 +514,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vllm_config.watermark_config
                     ),
                 )
+                self.greedy_vocab_shard = self._get_greedy_vocab_shard()
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 self.device,
@@ -1584,12 +1589,62 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _get_greedy_vocab_shard(self) -> tuple[int, int, int] | None:
+        """(vocab_start, num_valid, tp_size) of this rank's lm_head shard, when
+        the model exposes vocab-parallel logits through compute_logits_local
+        and the shard holds only base-vocab token ids."""
+        if self.lora_config is not None or self.batch_sharder is not None:
+            return None
+        get_language_model = getattr(self.model, "get_language_model", None)
+        language_model = get_language_model() if get_language_model else self.model
+        lm_head = getattr(language_model, "lm_head", None)
+        if not hasattr(language_model, "compute_logits_local") or not isinstance(
+            lm_head, ParallelLMHead
+        ):
+            return None
+        shard = lm_head.shard_indices
+        if shard.num_added_elements:
+            return None
+        return shard.org_vocab_start_index, shard.num_org_elements, lm_head.tp_size
+
+    def _verify_greedy_vocab_parallel(
+        self, hidden_states: torch.Tensor, input_batch: InputBatch
+    ) -> SamplerOutput | None:
+        """Verify an all-greedy speculative batch from this rank's vocab shard of
+        the target logits, skipping the full-vocab gather; None when the batch
+        needs the generic rejection sampler."""
+        if (
+            self.greedy_vocab_shard is None
+            or input_batch.num_reqs == 0
+            or input_batch.num_draft_tokens == 0
+        ):
+            return None
+        assert self.rejection_sampler is not None
+        if not self.rejection_sampler.can_verify_greedy_vocab_parallel(input_batch):
+            return None
+        local_logits = self.model.compute_logits_local(
+            hidden_states[input_batch.logits_indices]
+        )
+        return self.rejection_sampler.verify_greedy_vocab_parallel(
+            local_logits, input_batch, *self.greedy_vocab_shard
+        )
+
     def sample(
         self,
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        if grammar_output is None:
+            greedy_output = self._verify_greedy_vocab_parallel(
+                hidden_states, input_batch
+            )
+            if greedy_output is not None:
+                return (
+                    greedy_output,
+                    greedy_output.num_sampled,
+                    greedy_output.num_rejected,
+                )
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:

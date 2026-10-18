@@ -63,13 +63,13 @@ class Sampler:
 
         lp_req_state = LogitsProcRequestState.from_request_state(req_states)
         self.penalties_state = PenaltiesState(vllm_config, lp_req_state)
-        logit_bias_state = LogitBiasState(vllm_config, lp_req_state)
+        self.logit_bias_state = LogitBiasState(vllm_config, lp_req_state)
         bad_words_state = BadWordsState(vllm_config, lp_req_state)
 
         # List order is pipeline order: bias adds, penalties scale, so the
         # two do not commute.
         self.logits_processors: list[LogitsProcessor] = [
-            logit_bias_state,
+            self.logit_bias_state,
             self.penalties_state,
             bad_words_state,
             *custom_logits_processors,
@@ -83,6 +83,10 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        # Greedy requests whose only logits processing is min_tokens: their
+        # speculative tokens follow from vocab-parallel argmaxes
+        # (greedy_vocab_parallel.py).
+        self.greedy_argmax_only = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -98,9 +102,22 @@ class Sampler:
         needs_processing |= self.thinking_budget_state.add_request(
             req_idx, sampling_params
         )
+        other_processing = needs_processing
         for processor in self.logits_processors:
-            needs_processing |= processor.add_request(req_idx, sampling_params)
+            uses_processor = processor.add_request(req_idx, sampling_params)
+            needs_processing |= uses_processor
+            if processor is not self.logit_bias_state:
+                other_processing |= uses_processor
         self.needs_logits_processing[req_idx] = needs_processing
+        # The logit bias state also applies allowed_token_ids and logit_bias,
+        # and restores masked stop tokens for structured outputs.
+        self.greedy_argmax_only[req_idx] = (
+            sampling_params.temperature == 0.0
+            and not other_processing
+            and not sampling_params.allowed_token_ids
+            and not sampling_params.logit_bias
+            and sampling_params.structured_outputs is None
+        )
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
