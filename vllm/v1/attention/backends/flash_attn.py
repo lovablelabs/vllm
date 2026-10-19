@@ -566,6 +566,19 @@ class FlashAttentionMetadata:
     rswa_window_tensor: torch.Tensor | None = None
 
 
+def _expand_descale(scale: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
+    """Broadcast a layer's per-tensor (or per-head) FP8 descale to the
+    (num_seqs, num_kv_heads) shape the kernels take.
+
+    Expanding the 0-d scale directly gives every dim stride 0, and a (1, 1)
+    result counts as contiguous, so FA4's maybe_contiguous keeps it and FA4's
+    compile rejects the stride-0 leading dim: one sequence with one KV head per
+    rank, e.g. a drafter's batch-1 graph capture at high TP. Expanding from a
+    (1, N) view keeps a unit stride on dims that stay size 1.
+    """
+    return scale.reshape(1, -1).expand(shape)
+
+
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
 ) -> set[tuple[int, int] | None]:
@@ -1338,12 +1351,12 @@ class FlashAttentionImpl(AttentionImpl):
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             q_descale = (
-                layer._q_scale.expand(descale_shape)
+                _expand_descale(layer._q_scale, descale_shape)
                 if self.supports_quant_query_input
                 else None
             )
-            k_descale = layer._k_scale.expand(descale_shape)
-            v_descale = layer._v_scale.expand(descale_shape)
+            k_descale = _expand_descale(layer._k_scale, descale_shape)
+            v_descale = _expand_descale(layer._v_scale, descale_shape)
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
@@ -1780,11 +1793,11 @@ class FlashAttentionImpl(AttentionImpl):
             window_size=sliding_window_size,
             softcap=self.logits_soft_cap,
             fa_version=self.vllm_flash_attn_version,
-            q_descale=layer._q_scale.expand(descale_shape)  # type: ignore[operator]
+            q_descale=_expand_descale(layer._q_scale, descale_shape)
             if self.supports_quant_query_input
             else None,
-            k_descale=layer._k_scale.expand(descale_shape),  # type: ignore[operator]
-            v_descale=layer._v_scale.expand(descale_shape),  # type: ignore[operator]
+            k_descale=_expand_descale(layer._k_scale, descale_shape),
+            v_descale=_expand_descale(layer._v_scale, descale_shape),
             # The hd256 kernel does not support SplitKV.
             num_splits=1 if self.batch_invariant_enabled or self.fa4_hd256 else 0,
             s_aux=self.sinks,
@@ -2089,9 +2102,15 @@ def cascade_attention(
         return_softmax_lse=True,
         scheduler_metadata=prefix_scheduler_metadata,
         fa_version=fa_version,
-        q_descale=q_descale.expand(descale_shape) if q_descale is not None else None,
-        k_descale=k_descale.expand(descale_shape) if k_descale is not None else None,
-        v_descale=v_descale.expand(descale_shape) if v_descale is not None else None,
+        q_descale=_expand_descale(q_descale, descale_shape)
+        if q_descale is not None
+        else None,
+        k_descale=_expand_descale(k_descale, descale_shape)
+        if k_descale is not None
+        else None,
+        v_descale=_expand_descale(v_descale, descale_shape)
+        if v_descale is not None
+        else None,
         # s_aux is incorporated into prefix_lse inside the GPU kernel,
         # enabling its effect during the final attention merge.
         s_aux=s_aux,
@@ -2117,9 +2136,15 @@ def cascade_attention(
         return_softmax_lse=True,
         scheduler_metadata=suffix_scheduler_metadata,
         fa_version=fa_version,
-        q_descale=q_descale.expand(descale_shape) if q_descale is not None else None,
-        k_descale=k_descale.expand(descale_shape) if k_descale is not None else None,
-        v_descale=v_descale.expand(descale_shape) if v_descale is not None else None,
+        q_descale=_expand_descale(q_descale, descale_shape)
+        if q_descale is not None
+        else None,
+        k_descale=_expand_descale(k_descale, descale_shape)
+        if k_descale is not None
+        else None,
+        v_descale=_expand_descale(v_descale, descale_shape)
+        if v_descale is not None
+        else None,
         num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
     )
 
