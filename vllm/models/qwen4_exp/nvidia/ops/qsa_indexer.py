@@ -480,6 +480,7 @@ def _topk(
     compress_ratio: int,
     block_indices: torch.Tensor,
     topk_workspace: torch.Tensor,
+    canonicalize: bool = True,
 ) -> None:
     # similar dispatch logic as DeepSeek indexer
     block_topk = token_topk // compress_ratio
@@ -502,6 +503,245 @@ def _topk(
         block_topk,
         logits.shape[1],
     )
+    # The radix-select ops compact the selected blocks with atomics, so their
+    # order changes from call to call (and, for a row whose k-th score ties,
+    # the set). Sparse attention sums the blocks in list order, so outputs
+    # would change from run to run.
+    if canonicalize:
+        _canonicalize_topk(logits, visible_blocks, block_topk, block_indices)
+
+
+@triton.jit
+def _canonical_row(
+    base,
+    out_base,
+    visible,
+    width,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    UNROLL: tl.constexpr,
+):
+    """One program per row. The k-th score and its number of selected ties
+    come from the op's own output; a scan counts the row's ties at that
+    score. Rows without extra ties (the norm) already hold the canonical set
+    and are only sorted in registers; rows with extra ties are rewritten as
+    the columns above the k-th score plus the lowest tied columns."""
+    koffs = tl.arange(0, K)
+    selected = tl.load(out_base + koffs)
+    valid_sel = selected >= 0
+    scores = tl.load(
+        base + tl.where(valid_sel, selected, 0), mask=valid_sel, other=float("inf")
+    )
+    threshold = tl.min(scores, axis=0)
+    need = tl.sum((scores == threshold).to(tl.int32), axis=0)
+    offs = tl.arange(0, BLOCK)
+    # Columns past the row's visible count are never kept, so the scans stop
+    # there rather than at the logits width (the longest context a CUDA graph
+    # was captured for).
+    limit = tl.minimum(visible, width)
+    # Per-lane counts, reduced once: the unrolled loads of the scan overlap.
+    ties = tl.zeros((BLOCK,), dtype=tl.int32)
+    for start in tl.range(0, limit, BLOCK, loop_unroll_factor=UNROLL):
+        cols = start + offs
+        x = tl.load(base + cols, mask=cols < limit, other=float("-inf"))
+        ties += ((cols < limit) & (x == threshold)).to(tl.int32)
+    ties_total = tl.sum(ties, axis=0)
+    if ties_total > need:
+        written = tl.zeros((), dtype=tl.int32)
+        ties_seen = tl.zeros((), dtype=tl.int32)
+        for start in range(0, limit, BLOCK):
+            cols = start + offs
+            valid = cols < limit
+            x = tl.load(base + cols, mask=valid, other=float("-inf"))
+            above = valid & (x > threshold)
+            tie = valid & (x == threshold)
+            tie_rank = tl.cumsum(tie.to(tl.int32), axis=0) + ties_seen
+            keep = above | (tie & (tie_rank <= need))
+            pos = tl.cumsum(keep.to(tl.int32), axis=0) - 1 + written
+            tl.store(out_base + pos, cols.to(tl.int32), mask=keep & (pos < K))
+            written += tl.sum(keep.to(tl.int32), axis=0)
+            ties_seen += tl.sum(tie.to(tl.int32), axis=0)
+        pad = offs + written
+        tl.store(out_base + pad, tl.full((BLOCK,), -1, tl.int32), mask=pad < K)
+        tl.debug_barrier()
+        ordered = tl.load(out_base + koffs)
+    elif limit <= K:
+        # Every visible block is selected: the canonical row is 0..limit-1.
+        ordered = tl.where(koffs < limit, koffs, -1)
+        tl.store(out_base + koffs, ordered)
+    else:
+        keys = tl.where(valid_sel, selected, 2147483647)
+        ordered = tl.sort(keys, dim=0)
+        ordered = tl.where(ordered == 2147483647, -1, ordered)
+        tl.store(out_base + koffs, ordered)
+    return ordered
+
+
+@triton.jit
+def _canonicalize_topk_kernel(
+    logits_ptr,
+    stride_row,
+    visible_ptr,
+    out_ptr,
+    width,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    UNROLL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    _canonical_row(
+        logits_ptr + row.to(tl.int64) * stride_row,
+        out_ptr + row.to(tl.int64) * K,
+        tl.load(visible_ptr + row),
+        width,
+        K=K,
+        BLOCK=BLOCK,
+        UNROLL=UNROLL,
+    )
+
+
+@triton.jit
+def _canonicalize_expand_kernel(
+    logits_ptr,
+    stride_row,
+    visible_ptr,
+    query_positions_ptr,
+    blocks_ptr,
+    output_ptr,
+    stride_output_row,
+    width,
+    K: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK: tl.constexpr,
+    UNROLL: tl.constexpr,
+):
+    """_canonicalize_topk_kernel followed by _expand_qsa_indices_kernel for
+    one row, from registers: one launch instead of two on decode steps."""
+    OUTPUT_WIDTH: tl.constexpr = K * COMPRESS_RATIO + COMPRESS_RATIO - 1
+    row = tl.program_id(0)
+    visible = tl.load(visible_ptr + row)
+    ordered = _canonical_row(
+        logits_ptr + row.to(tl.int64) * stride_row,
+        blocks_ptr + row.to(tl.int64) * K,
+        visible,
+        width,
+        K=K,
+        BLOCK=BLOCK,
+        UNROLL=UNROLL,
+    )
+    query_position = tl.load(query_positions_ptr + row)
+    expanded_count = tl.minimum(visible, K) * COMPRESS_RATIO
+    tail_start = ((query_position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
+    tail_count = (query_position + 1) - tail_start
+    out_base = output_ptr + row.to(tl.int64) * stride_output_row
+    # Canonical blocks are ascending with the -1 padding last, so rank r
+    # holds the r-th selected block, as the expansion kernel reads it.
+    offsets = tl.arange(0, COMPRESS_RATIO)
+    tokens = tl.reshape(
+        ordered[:, None] * COMPRESS_RATIO + offsets[None, :], [K * COMPRESS_RATIO]
+    )
+    valid_block = tl.reshape(
+        (ordered[:, None] >= 0) & (offsets[None, :] >= 0), [K * COMPRESS_RATIO]
+    )
+    columns = tl.arange(0, K * COMPRESS_RATIO)
+    tail_offset = columns - expanded_count
+    is_tail = (
+        (columns >= expanded_count)
+        & (tail_offset < tail_count)
+        & (tail_offset < COMPRESS_RATIO - 1)
+    )
+    value = tl.where(
+        (columns < expanded_count) & valid_block,
+        tokens,
+        tl.where(is_tail, tail_start + tail_offset, -1),
+    )
+    tl.store(out_base + columns, value)
+    # The last COMPRESS_RATIO - 1 index columns lie past every expanded block.
+    extra = K * COMPRESS_RATIO + offsets
+    extra_offset = extra - expanded_count
+    is_extra_tail = (extra_offset < tail_count) & (extra_offset < COMPRESS_RATIO - 1)
+    tl.store(
+        out_base + extra,
+        tl.where(is_extra_tail, tail_start + extra_offset, -1),
+        mask=extra < OUTPUT_WIDTH,
+    )
+    # Trailing count column, as in _expand_qsa_indices_kernel.
+    tl.store(out_base + OUTPUT_WIDTH, expanded_count + tail_count)
+
+
+def _canonicalize_topk(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    block_topk: int,
+    block_indices: torch.Tensor,
+    config: tuple[int, int, int] | None = None,
+) -> None:
+    """Rewrite a radix-select result as the canonical top-k: ascending
+    column ids, ties at the k-th score resolved to the lowest columns.
+    ``config`` overrides the scan layout (see _canonical_scan_config)."""
+    rows, width = logits.shape
+    assert block_indices.stride(0) == block_topk and block_indices.stride(1) == 1
+    block, num_warps, unroll = config or _canonical_scan_config(rows, width)
+    # The padding store of a rewritten row covers one scan block.
+    assert block >= block_topk
+    _canonicalize_topk_kernel[(rows,)](
+        logits,
+        logits.stride(0),
+        visible_blocks,
+        block_indices,
+        width,
+        K=block_topk,
+        BLOCK=block,
+        UNROLL=unroll,
+        num_warps=num_warps,
+    )
+
+
+def _canonical_scan_config(rows: int, width: int) -> tuple[int, int, int]:
+    """(scan block, warps, unroll) by launch shape; the output never depends
+    on it. Few rows are latency bound: unrolled narrow scans keep several
+    loads in flight per row. Prefill chunks of short contexts scan on one
+    warp."""
+    if rows <= 128:
+        return 2048, 8, 4
+    if width <= 6144:
+        return 512, 1, 1
+    return 1024, 4, 4
+
+
+def _canonicalize_expand(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    block_indices: torch.Tensor,
+    query_positions: torch.Tensor,
+    compress_ratio: int,
+    out: torch.Tensor,
+    config: tuple[int, int, int] | None = None,
+) -> None:
+    """_canonicalize_topk then expand_qsa_block_indices, in one launch;
+    block_indices holds the radix-select result and is scratch afterwards."""
+    rows, width = logits.shape
+    block_topk = block_indices.shape[1]
+    assert block_indices.stride(0) == block_topk and block_indices.stride(1) == 1
+    assert out.shape == (rows, block_topk * compress_ratio + compress_ratio)
+    assert out.stride(1) == 1
+    block, num_warps, unroll = config or _canonical_scan_config(rows, width)
+    assert block >= block_topk
+    _canonicalize_expand_kernel[(rows,)](
+        logits,
+        logits.stride(0),
+        visible_blocks,
+        query_positions,
+        block_indices,
+        out,
+        out.stride(0),
+        width,
+        K=block_topk,
+        COMPRESS_RATIO=compress_ratio,
+        BLOCK=block,
+        UNROLL=unroll,
+        num_warps=num_warps,
+    )
 
 
 def qsa_select_paged_decode(
@@ -513,6 +753,8 @@ def qsa_select_paged_decode(
     compress_ratio: int,
     decode_query_len: int,
     block_indices: torch.Tensor,
+    query_positions: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> None:
     """Score and select compressed blocks for a request-major decode batch.
 
@@ -527,10 +769,15 @@ def qsa_select_paged_decode(
         compress_ratio: Number of logical tokens represented by a cache row.
         decode_query_len: Number of query tokens per request.
         block_indices: Compressed-index output buffer.
+        query_positions: With ``out``, each query's logical position.
+        out: Packed token-index buffer (see expand_qsa_block_indices); when
+            given, the selection is expanded into it directly and
+            ``block_indices`` is only scratch.
 
     """
     assert token_topk % compress_ratio == 0
     assert block_indices.shape == (q.shape[0], token_topk // compress_ratio)
+    assert (query_positions is None) == (out is None)
     assert decode_query_len > 0 and q.shape[0] % decode_query_len == 0
     assert q.dtype == k_cache.dtype, "Q and the compressed K cache must match"
     num_requests = q.shape[0] // decode_query_len
@@ -572,7 +819,12 @@ def qsa_select_paged_decode(
         compress_ratio,
         block_indices,
         torch.empty((_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device),
+        canonicalize=out is None,
     )
+    if out is not None:
+        _canonicalize_expand(
+            logits, visible_blocks, block_indices, query_positions, compress_ratio, out
+        )
 
 
 def qsa_select_paged_prefill(
