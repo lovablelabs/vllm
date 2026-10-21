@@ -20,7 +20,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
                             const torch::stable::Tensor& lengths,
                             torch::stable::Tensor& output,
                             torch::stable::Tensor& workspace,
-                            int64_t max_seq_len) {
+                            int64_t max_seq_len, int32_t* tie_flags) {
   namespace P = vllm::persistent;
 
   const torch::stable::accelerator::DeviceGuard device_guard(
@@ -52,12 +52,17 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
         logits.const_data_ptr<float>(), lengths.const_data_ptr<int32_t>(),
         output.mutable_data_ptr<int32_t>(), stride,
         static_cast<int>(std::min(max_seq_len, logits.size(1))));
+    if (tie_flags != nullptr) {
+      // Not tracked by the sampled kernel: every row may have broken a tie.
+      cudaMemsetAsync(tie_flags, 1, num_rows * sizeof(int32_t), stream);
+    }
   } else if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
     cudaError_t status =
         vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
             logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
             lengths.const_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
-            static_cast<uint32_t>(TopK), static_cast<uint32_t>(stride), stream);
+            static_cast<uint32_t>(TopK), static_cast<uint32_t>(stride), stream,
+            tie_flags);
     STD_TORCH_CHECK(status == cudaSuccess,
                     "FilteredTopK failed: ", cudaGetErrorString(status));
   } else {
@@ -156,6 +161,9 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
         const int64_t next_n = lengths.dim() == 2 ? lengths.size(1) : 1;
         top_k_per_row_decode(logits, next_n, lengths, output, num_rows,
                              logits.stride(0), logits.stride(1), TopK);
+        if (tie_flags != nullptr) {
+          cudaMemsetAsync(tie_flags, 1, num_rows * sizeof(int32_t), stream);
+        }
         return;
       }
       cudaError_t status =
@@ -164,7 +172,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
               output.mutable_data_ptr<int32_t>(),
               lengths.const_data_ptr<int32_t>(),
               static_cast<uint32_t>(num_rows), static_cast<uint32_t>(TopK),
-              static_cast<uint32_t>(stride), stream);
+              static_cast<uint32_t>(stride), stream, tie_flags);
       STD_TORCH_CHECK(status == cudaSuccess, "FilteredTopK fallback failed: ",
                       cudaGetErrorString(status));
       return;
@@ -218,6 +226,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
         workspace.mutable_data_ptr<uint8_t>());
     params.ctas_per_group = ctas_per_group;
     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
+    params.tie_flags = tie_flags;
 
   #define LAUNCH_PERSISTENT(TOPK_VAL, VS)                                     \
     do {                                                                      \
@@ -251,7 +260,8 @@ void persistent_topk(const torch::stable::Tensor& logits,
                      const torch::stable::Tensor& lengths,
                      torch::stable::Tensor& output,
                      torch::stable::Tensor& workspace, int64_t k,
-                     int64_t max_seq_len) {
+                     int64_t max_seq_len,
+                     std::optional<torch::stable::Tensor> const& tie_flags) {
 #ifndef USE_ROCM
   STD_TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
   STD_TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
@@ -277,18 +287,29 @@ void persistent_topk(const torch::stable::Tensor& logits,
       k == 512 || k == 1024 || k == 2048,
       "persistent_topk supports k=512, k=1024, or k=2048, got k=", k);
 
+  int32_t* tie_flags_ptr = nullptr;
+  if (tie_flags.has_value()) {
+    STD_TORCH_CHECK(tie_flags->is_cuda() && tie_flags->is_contiguous() &&
+                        tie_flags->scalar_type() ==
+                            torch::headeronly::ScalarType::Int &&
+                        tie_flags->numel() == num_rows,
+                    "tie_flags must be a contiguous int32 CUDA tensor with "
+                    "one entry per row");
+    tie_flags_ptr = tie_flags->mutable_data_ptr<int32_t>();
+  }
+
   const torch::stable::accelerator::DeviceGuard device_guard(
       logits.get_device_index());
 
   if (k == 512) {
     launch_persistent_topk<512>(logits, lengths, output, workspace,
-                                max_seq_len);
+                                max_seq_len, tie_flags_ptr);
   } else if (k == 1024) {
     launch_persistent_topk<1024>(logits, lengths, output, workspace,
-                                 max_seq_len);
+                                 max_seq_len, tie_flags_ptr);
   } else {
     launch_persistent_topk<2048>(logits, lengths, output, workspace,
-                                 max_seq_len);
+                                 max_seq_len, tie_flags_ptr);
   }
 #else
   STD_TORCH_CHECK(false, "persistent_topk is not supported on ROCm");

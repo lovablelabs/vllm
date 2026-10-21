@@ -54,7 +54,7 @@ void launch_cooperative_topk_impl(const torch::stable::Tensor& logits,
                                   const torch::stable::Tensor& lengths,
                                   torch::stable::Tensor& output,
                                   torch::stable::Tensor& workspace,
-                                  int64_t max_seq_len) {
+                                  int64_t max_seq_len, int32_t* tie_flags) {
   (void)max_seq_len;  // Kept for signature parity with persistent_topk.
   const int64_t num_rows = logits.size(0);
   const cudaStream_t stream = get_current_cuda_stream();
@@ -83,6 +83,7 @@ void launch_cooperative_topk_impl(const torch::stable::Tensor& logits,
   params.stride = stride;
   params.tie_ws =
       reinterpret_cast<hist4096::Tie*>(workspace.mutable_data_ptr<uint8_t>());
+  params.tie_flags = tie_flags;
 
   constexpr uint32_t kTieWsPerRow =
       TopK <= hist4096::kBlockSize ? hist4096::kMaxTies : TopK;
@@ -108,7 +109,8 @@ void cooperative_topk(const torch::stable::Tensor& logits,
                       const torch::stable::Tensor& lengths,
                       torch::stable::Tensor& output,
                       torch::stable::Tensor& workspace, int64_t k,
-                      int64_t max_seq_len) {
+                      int64_t max_seq_len,
+                      std::optional<torch::stable::Tensor> const& tie_flags) {
 #ifndef USE_ROCM
   STD_TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
   STD_TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
@@ -131,16 +133,26 @@ void cooperative_topk(const torch::stable::Tensor& logits,
   STD_TORCH_CHECK(
       k == 512 || k == 1024 || k == 2048,
       "cooperative_topk supports k=512, k=1024, or k=2048, got k=", k);
+  int32_t* tie_flags_ptr = nullptr;
+  if (tie_flags.has_value()) {
+    STD_TORCH_CHECK(tie_flags->is_cuda() && tie_flags->is_contiguous() &&
+                        tie_flags->scalar_type() ==
+                            torch::headeronly::ScalarType::Int &&
+                        tie_flags->numel() == num_rows,
+                    "tie_flags must be a contiguous int32 CUDA tensor with "
+                    "one entry per row");
+    tie_flags_ptr = tie_flags->mutable_data_ptr<int32_t>();
+  }
 
   if (k == 512) {
     launch_cooperative_topk_impl<512>(logits, lengths, output, workspace,
-                                      max_seq_len);
+                                      max_seq_len, tie_flags_ptr);
   } else if (k == 1024) {
     launch_cooperative_topk_impl<1024>(logits, lengths, output, workspace,
-                                       max_seq_len);
+                                       max_seq_len, tie_flags_ptr);
   } else {
     launch_cooperative_topk_impl<2048>(logits, lengths, output, workspace,
-                                       max_seq_len);
+                                       max_seq_len, tie_flags_ptr);
   }
 #else
   STD_TORCH_CHECK(false, "cooperative_topk is not supported on ROCm");

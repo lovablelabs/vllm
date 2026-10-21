@@ -118,16 +118,21 @@ __device__ __forceinline__ uint32_t warp_reduce_sum_full(uint32_t v) {
 // ============================================================================
 // Tie refinement (single CTA): 4-round radix-256 topK on the full FP32 ordered
 // key Each round narrows by 8 bits until ties are fully resolved
+//
+// Returns true when the last round had to pick a strict subset of exactly
+// equal keys: which of them win depends on atomic arrival order, so the
+// selected set can change from call to call.
 // ============================================================================
 
 template <uint32_t TopK>
-__device__ void tie_handle(const Tie* ties, uint32_t num_ties,
+__device__ bool tie_handle(const Tie* ties, uint32_t num_ties,
                            uint32_t num_above, int32_t* output, void* _smem) {
   struct TS {
     alignas(128) uint32_t counter;
     alignas(128) MatchBin match;
     uint32_t histogram[RADIX];
     uint32_t warp_sum[kNumWarps];
+    uint32_t equal_subset;
   };
   auto* s = static_cast<TS*>(_smem);
   const auto tx = threadIdx.x;
@@ -142,6 +147,7 @@ __device__ void tie_handle(const Tie* ties, uint32_t num_ties,
   uint32_t remain =
       TopK - num_above;  // decreases each round as ties are resolved.
   uint32_t wpos = TopK;  // wpos will hold the final output position.
+  bool broke = false;
   s->counter = 0;
   __syncthreads();
 
@@ -154,6 +160,9 @@ __device__ void tie_handle(const Tie* ties, uint32_t num_ties,
 
     // Step 1: Build 256-bin histogram.
     if (tx < RADIX) s->histogram[tx] = 0;
+    // TS overlays the caller's smem (tie buffer included), so this is written
+    // only after every thread loaded its tie (the barrier above).
+    if (r == 3 && tx == 0) s->equal_subset = 0;
     __syncthreads();
     if (active) atomicAdd(&s->histogram[bin], 1);
     __syncthreads();
@@ -174,9 +183,11 @@ __device__ void tie_handle(const Tie* ties, uint32_t num_ties,
       auto above = tot - (inter + wi2);
       if (above < remain && above + hv >= remain) {
         s->match = {tx, above, remain - above};
+        if (r == 3) s->equal_subset = hv > remain - above;
       }
     }
     __syncthreads();
+    if (r == 3) broke = s->equal_subset != 0;
 
     // Step 3: Scatter
     auto [thr, na, _] = s->match;  // threshold bin, num above, unused
@@ -196,13 +207,14 @@ __device__ void tie_handle(const Tie* ties, uint32_t num_ties,
   }
   // Final write
   if (wpos < TopK) output[wpos] = tie.idx;
+  return broke;
 }
 
 // Extended tie_handle for TopK > kBlockSize (e.g. TopK=2048).
 // tie_handle assumes 1 tie per thread (max 1024).
 // This version handles 2 ties per thread via kPerThread=2
 template <uint32_t TopK>
-__device__ void tie_handle_large(const Tie* ties, uint32_t num_ties,
+__device__ bool tie_handle_large(const Tie* ties, uint32_t num_ties,
                                  uint32_t num_above, int32_t* output,
                                  void* _smem) {
   static_assert(TopK > kBlockSize);
@@ -305,6 +317,9 @@ __device__ void tie_handle_large(const Tie* ties, uint32_t num_ties,
     s->counter = 0;
     __syncthreads();
   }
+  // Not tracked per round here: report any refinement as a possible
+  // tie-break.
+  return true;
 }
 
 // ============================================================================
@@ -330,7 +345,7 @@ struct Histogram4096Smem {
 template <uint32_t TopK, uint32_t HIST_BITS,
           uint32_t VECS_PER_THREAD = kHist4096VecsPerThread,
           bool UsePredicatedLoads = false>
-__device__ void histogram_4096_topk(const float* __restrict__ scores,
+__device__ bool histogram_4096_topk(const float* __restrict__ scores,
                                     int32_t* __restrict__ output,
                                     uint32_t length, void* _smem) {
   constexpr uint32_t HIST_BINS = 1 << HIST_BITS;
@@ -478,9 +493,12 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
   }
 
   // Phase 4: Tie-breaking
-  if (!need_tie) return;
+  if (!need_tie) return false;
   __syncthreads();
 
+  // More than TopK elements share the threshold bin: only the first TopK to
+  // arrive were kept for refinement, so the result depends on arrival order.
+  const bool truncated = num_equal > TopK;
   // Fast warp-ballot tie-breaking for small tie counts
   const uint32_t num_ties = min(num_equal, static_cast<uint32_t>(TopK));
   const uint32_t topk_remain =
@@ -496,7 +514,7 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
     // comparisons in one instruction per warp. O(1) work.
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = tx / kWarpSize;
-    if (lane_id >= num_ties || warp_id >= num_ties) return;
+    if (lane_id >= num_ties || warp_id >= num_ties) return truncated;
     const uint32_t mask = (1ull << num_ties) - 1u;
     const auto tie = smem->tie_buffer[lane_id];  // each lane holds one tie
     const auto target =
@@ -540,21 +558,26 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
   } else {
     // Large tie count: fall back to 4-round radix-256 sort
     if constexpr (TopK <= kBlockSize) {
-      tie_handle<TopK>(smem->tie_buffer, num_ties, num_above, output, smem);
+      return tie_handle<TopK>(smem->tie_buffer, num_ties, num_above, output,
+                              smem) ||
+             truncated;
     } else {
-      tie_handle_large<TopK>(smem->tie_buffer, num_ties, num_above, output,
-                             smem);
+      return tie_handle_large<TopK>(smem->tie_buffer, num_ties, num_above,
+                                    output, smem) ||
+             truncated;
     }
   }
+  // Up to 2 * kWarpSize ties are ranked by (score, lower index): exact.
+  return truncated;
 }
 
 template <uint32_t TopK, uint32_t HIST_BITS,
           uint32_t VECS_PER_THREAD = kHist4096VecsPerThread>
-__device__ __noinline__ void histogram_4096_topk_predicated(
+__device__ __noinline__ bool histogram_4096_topk_predicated(
     const float* __restrict__ scores, int32_t* __restrict__ output,
     uint32_t length, void* _smem) {
-  histogram_4096_topk<TopK, HIST_BITS, VECS_PER_THREAD, true>(scores, output,
-                                                              length, _smem);
+  return histogram_4096_topk<TopK, HIST_BITS, VECS_PER_THREAD, true>(
+      scores, output, length, _smem);
 }
 
 }  // namespace topk_histogram_4096

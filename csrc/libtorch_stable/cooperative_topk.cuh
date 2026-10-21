@@ -46,6 +46,10 @@ struct CooperativeTopKParams {
   const int32_t* __restrict__ lengths;
   hist4096::Tie* __restrict__ tie_ws;  // per-row tie workspace, see
                                        // kTieWsPerRow
+  // Optional [num_rows]: 1 where the selection broke a tie among exactly
+  // equal scores (or truncated a tie buffer), so the chosen set may differ
+  // between calls; 0 where the selected set is unique.
+  int32_t* __restrict__ tie_flags;
   uint32_t num_rows, stride;
 };
 
@@ -257,7 +261,8 @@ using SmemSinglePass = SmemFused<kMaxSinglePassStages>;
 template <uint32_t TopK, uint32_t CS, typename SmemType, bool kFused>
 __device__ void large_topk(const float* __restrict__ row_input,
                            int32_t* __restrict__ row_output, uint32_t seq_len,
-                           uint32_t* phases, hist4096::Tie* tie_ws) {
+                           uint32_t* phases, hist4096::Tie* tie_ws,
+                           int32_t* tie_flag) {
   const auto rank = blockIdx.y;  // this block's position in cluster
   const auto tx = threadIdx.x;
   const auto lane = tx % hist4096::kWarpSize;
@@ -397,14 +402,18 @@ __device__ void large_topk(const float* __restrict__ row_input,
 
   __shared__ uint32_t s_local_counts[CS];
   __shared__ uint32_t s_prefix_packed;
-  __shared__ uint32_t s_total_above, s_total_equal;
+  __shared__ uint32_t s_total_above, s_total_equal, s_truncated;
+  // Bit 31 of a packed count flags a block whose tie buffer overflowed.
+  constexpr uint32_t kTruncatedBit = 1u << 31;
+  static_assert(hist4096::kMaxTies < (1u << (31 - kAboveBits)));
 
   auto cluster = cooperative_groups::this_cluster();
   if (tx < CS) {
     // Pack written tie counts into 32-bit: (equal << 16) | above.
     // `le_full` may exceed the per-block tie buffer cap; using it here creates
     // holes in tie_ws and can make TopK=2048 refine unwritten workspace slots.
-    const uint32_t packed = (le << kAboveBits) | la;
+    const uint32_t packed =
+        (le << kAboveBits) | la | (le_full > le ? kTruncatedBit : 0u);
     const auto dst = cluster.map_shared_rank(s_local_counts, tx);
     dst[rank] = packed;  // write my count to every block's s_local_counts[rank]
   }
@@ -412,17 +421,20 @@ __device__ void large_topk(const float* __restrict__ row_input,
 
   // Thread 0 computes serial prefix sum
   if (tx == 0) {
-    uint32_t prefix = 0, ta = 0, te = 0;
+    uint32_t prefix = 0, ta = 0, te = 0, truncated = 0;
     for (uint32_t i = 0; i < CS; i++) {
+      const uint32_t counts = s_local_counts[i] & ~kTruncatedBit;
+      truncated |= s_local_counts[i] & kTruncatedBit;
       if (i == rank) {
         s_prefix_packed = prefix;  // my prefix
       }
-      ta += s_local_counts[i] & kAboveMask;   // total above
-      te += s_local_counts[i] >> kAboveBits;  // total equal
-      prefix += s_local_counts[i];
+      ta += counts & kAboveMask;   // total above
+      te += counts >> kAboveBits;  // total equal
+      prefix += counts;
     }
     s_total_above = ta;
     s_total_equal = te;
+    s_truncated = truncated != 0;
   }
   __syncthreads();
 
@@ -453,6 +465,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
     return;
   }
   if (s_total_above + s_total_equal <= TopK) {  // no ties to refine
+    if (tie_flag != nullptr && tx == 0) *tie_flag = s_truncated;
     return;
   }
 
@@ -465,13 +478,19 @@ __device__ void large_topk(const float* __restrict__ row_input,
       smem->tie_buffer[i] = hist4096::Tie{tie_ws[i].idx, tie_ws[i].score};
     }
     __syncthreads();
-    hist4096::tie_handle<TopK>(smem->tie_buffer, num_ties, s_total_above,
-                               row_output, smem);
+    const bool broke = hist4096::tie_handle<TopK>(
+        smem->tie_buffer, num_ties, s_total_above, row_output, smem);
+    if (tie_flag != nullptr && tx == 0) {
+      *tie_flag = broke || s_truncated || s_total_equal > num_ties;
+    }
   } else {
     // TopK=2048: process directly from tie_ws (GMEM)
     const uint32_t num_ties = min(s_total_equal, static_cast<uint32_t>(TopK));
-    hist4096::tie_handle_large<TopK>(tie_ws, num_ties, s_total_above,
-                                     row_output, smem);
+    const bool broke = hist4096::tie_handle_large<TopK>(
+        tie_ws, num_ties, s_total_above, row_output, smem);
+    if (tie_flag != nullptr && tx == 0) {
+      *tie_flag = broke || s_truncated || s_total_equal > num_ties;
+    }
   }
 }
 
@@ -490,6 +509,8 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
   const int32_t sl = params.lengths[row] > 0 ? params.lengths[row] : 0;
   int32_t* out = params.output + row * TopK;
   const float* in = params.input + row * params.stride;
+  int32_t* tie_flag =
+      params.tie_flags != nullptr ? params.tie_flags + row : nullptr;
 
   // Trivial: seq_len <= TopK
   if (sl <= static_cast<int32_t>(TopK)) {
@@ -497,6 +518,7 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
       for (uint32_t i = tx; i < TopK; i += hist4096::kBlockSize) {
         out[i] = (i < static_cast<uint32_t>(sl)) ? static_cast<int32_t>(i) : -1;
       }
+      if (tie_flag != nullptr && tx == 0) *tie_flag = 0;
     }
     return;
   }
@@ -505,8 +527,9 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
   if (sl <= static_cast<int32_t>(hist4096::kHist4096MaxLen)) {
     if (rank == 0) {
       extern __shared__ uint8_t sr[];
-      hist4096::histogram_4096_topk<TopK, 12>(
+      const bool broke = hist4096::histogram_4096_topk<TopK, 12>(
           in, out, sl, sr);  // 4096-bin (12-bit) histogram
+      if (tie_flag != nullptr && tx == 0) *tie_flag = broke;
     }
     return;
   }
@@ -545,7 +568,8 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
     __syncthreads();
     uint32_t phases[kFusedStages] =
         {};  // tracks the parity for mbarrier wait/arrive protocol
-    large_topk<TopK, CS, FusedSmem, true>(in, out, sl, phases, row_tie_ws);
+    large_topk<TopK, CS, FusedSmem, true>(in, out, sl, phases, row_tie_ws,
+                                          tie_flag);
   } else {
     // Streaming path for cluster sizes whose per-block input exceeds the
     // single-pass staging capacity.
@@ -557,7 +581,8 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
     __syncthreads();
     uint32_t hp[kStreamingStagesCS4] = {0,
                                         0};  // histogram+scatter pass counters
-    large_topk<TopK, CS, Smem4, false>(in, out, sl, hp, row_tie_ws);
+    large_topk<TopK, CS, Smem4, false>(in, out, sl, hp, row_tie_ws,
+                                       tie_flag);
   }
 }
 

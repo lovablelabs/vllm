@@ -2034,3 +2034,77 @@ def test_sparse_indexer_topk_aiter_expands_mtp_row_ends(monkeypatch) -> None:
 
     assert recorded["next_n"] == 1
     assert recorded["row_ends"] == [99, 100, 199, 200]
+
+
+def _canonical_topk(logits: torch.Tensor, lengths: torch.Tensor, k: int):
+    """Exact top-k with ties at the k-th score resolved to the lowest
+    columns, as sorted index rows padded with -1. Scores order as in the
+    ops: float order with -0.0 below +0.0."""
+    columns = torch.arange(logits.shape[1], device=logits.device)
+    hidden = columns[None, :] >= lengths[:, None]
+    bits = logits.view(torch.int32)
+    keys = (bits ^ ((bits >> 31) & 0x7FFFFFFF)).masked_fill(
+        hidden, torch.iinfo(torch.int32).min
+    )
+    # Stable sort on the key keeps tied columns in ascending order.
+    top = torch.sort(keys, dim=1, descending=True, stable=True).indices[:, :k]
+    top = top.to(torch.int32).masked_fill(hidden.gather(1, top), -1)
+    top = torch.sort(top.masked_fill(top < 0, 2**30), dim=1).values
+    return top.masked_fill(top == 2**30, -1)
+
+
+# (rows, width): cooperative trivial / short / large cluster paths; persistent
+# per-row kernel (rows <= 32), filtered short and long-row paths (rows > 32).
+TIE_FLAG_SHAPES = [
+    (4, 2048),
+    (16, 12000),
+    (16, 30000),
+    (64, 20000),
+    (48, 30000),
+    (96, 40000),
+    (16, 40000),
+]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("backend", WORKSPACE_TOPK_BACKENDS)
+@pytest.mark.parametrize("num_rows,width", TIE_FLAG_SHAPES)
+@pytest.mark.parametrize("scores", ["continuous", "few_ties", "many_ties"])
+@torch.inference_mode()
+def test_workspace_topk_tie_flags(backend, num_rows, width, scores) -> None:
+    """tie_flags is written for every row and is 0 only where the selected
+    set is the canonical one (no tie at the k-th score was broken by arrival
+    order); with continuous scores the instrumented paths flag nothing."""
+    top_k = 512
+    if backend == "cooperative_topk" and num_rows > 64:
+        pytest.skip("cooperative_topk supports <=64 rows")
+    gen = torch.Generator(device="cuda").manual_seed(num_rows * 131 + width)
+    logits = torch.randn(num_rows, width, device="cuda", generator=gen)
+    if scores == "few_ties":
+        logits = (logits * 64).round() / 64  # a handful of equal scores per value
+    elif scores == "many_ties":
+        logits = (logits * 4).round() / 4  # hundreds of equal scores per value
+    lengths = torch.randint(
+        width // 2,
+        width + 1,
+        (num_rows,),
+        device="cuda",
+        generator=gen,
+        dtype=torch.int32,
+    )
+    lengths[0] = 300  # fewer visible scores than k
+    indices = torch.empty(num_rows, top_k, device="cuda", dtype=torch.int32)
+    flags = torch.full((num_rows,), -1, device="cuda", dtype=torch.int32)
+    workspace = torch.empty(RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device="cuda")
+    op = getattr(torch.ops._C, backend)
+    op(logits, lengths, indices, workspace, top_k, width, flags)
+
+    assert (flags >= 0).all(), "every row must be written"
+    canonical = _canonical_topk(logits, lengths, top_k)
+    selected = torch.sort(indices.masked_fill(indices < 0, 2**30), dim=1).values
+    selected = selected.masked_fill(selected == 2**30, -1)
+    unflagged = flags == 0
+    assert torch.equal(selected[unflagged], canonical[unflagged])
+    instrumented = backend == "cooperative_topk" or (num_rows > 32 and width <= 32768)
+    if scores == "continuous" and instrumented:
+        assert not flags.any()

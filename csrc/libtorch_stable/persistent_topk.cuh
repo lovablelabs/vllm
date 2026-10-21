@@ -138,6 +138,10 @@ struct PersistentTopKParams {
   uint32_t chunk_size;      // large path: elements per CTA
   uint32_t ctas_per_group;  // 1=medium, >1=large
   uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
+  // Optional [num_rows]: 0 where the selected set is unique, nonzero where a
+  // tie among exactly equal scores may have been broken (the decode, medium
+  // and radix paths report every row they refine as such).
+  int32_t* tie_flags;
 };
 
 // ============================================================================
@@ -942,6 +946,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
         } else {
           histogram_256_topk<TopK>(row_input, row_output, 0, seq_len);
         }
+        if (params.tie_flags != nullptr && tx == 0) {
+          params.tie_flags[row_idx] = seq_len > static_cast<uint32_t>(TopK);
+        }
       }
       continue;
     }
@@ -951,6 +958,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
         row_input, row_output, seq_len, my_chunk_start, chunk_size,
         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
         cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx);
+    if (params.tie_flags != nullptr && cta_in_group == 0 && tx == 0) {
+      params.tie_flags[row_idx] = 1;
+    }
     radix_iter++;
   }
 }
@@ -1046,7 +1056,7 @@ template <typename DType, typename IdType, int VEC_SIZE, uint32_t MAX_K,
           bool UsePredicatedShortLoads, bool CheckOverflow = false>
 __device__ __forceinline__ bool filtered_topk_row(
     const DType* score, IdType* dst, int length, uint32_t top_k,
-    FilteredTopKStorage<MAX_K>& storage) {
+    FilteredTopKStorage<MAX_K>& storage, int32_t* tie_flag = nullptr) {
   constexpr uint32_t BLOCK_SIZE = FILTERED_TOPK_BLOCK_THREADS;
   constexpr int RADIX = 256;
   constexpr int SMEM_INPUT_SIZE = FILTERED_TOPK_SMEM_INPUT_SIZE;
@@ -1057,21 +1067,27 @@ __device__ __forceinline__ bool filtered_topk_row(
     for (int i = tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
       dst[i] = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
     }
+    if (tie_flag != nullptr && tx == 0) *tie_flag = 0;
     return true;
   }
 
   // Short path
   if (length <= 32768) {
     extern __shared__ uint8_t _smem_reg[];
+    bool broke;
     if constexpr (UsePredicatedShortLoads) {
-      hist4096::histogram_4096_topk_predicated<MAX_K, 12, 8>(score, dst, length,
-                                                             _smem_reg);
+      broke = hist4096::histogram_4096_topk_predicated<MAX_K, 12, 8>(
+          score, dst, length, _smem_reg);
     } else {
-      hist4096::histogram_4096_topk<MAX_K, 12, 8>(score, dst, length,
-                                                  _smem_reg);
+      broke = hist4096::histogram_4096_topk<MAX_K, 12, 8>(score, dst, length,
+                                                          _smem_reg);
     }
+    if (tie_flag != nullptr && tx == 0) *tie_flag = broke;
     return true;
   }
+
+  // Long rows: the refinement below does not track tie-breaks.
+  if (tie_flag != nullptr && tx == 0) *tie_flag = 1;
 
   auto& s_histogram_buf = storage.histogram;
   auto& s_counter = storage.counter;
@@ -1295,13 +1311,14 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
                               IdType* __restrict__ output,
                               const IdType* __restrict__ lengths,
                               uint32_t num_rows, uint32_t top_k,
-                              uint32_t max_len) {
+                              uint32_t max_len, int32_t* tie_flags) {
   const uint32_t bid = blockIdx.x;
   if (bid >= num_rows) return;
   const int length = lengths ? lengths[bid] : static_cast<int>(max_len);
   __shared__ FilteredTopKStorage<MAX_K> storage;
   filtered_topk_row<DType, IdType, VEC_SIZE, MAX_K, UsePredicatedShortLoads>(
-      input + bid * max_len, output + bid * top_k, length, top_k, storage);
+      input + bid * max_len, output + bid * top_k, length, top_k, storage,
+      tie_flags != nullptr ? tie_flags + bid : nullptr);
 }
 
 // Helper to compute GCD for VEC_SIZE selection
@@ -1330,14 +1347,15 @@ cudaError_t FilteredTopKRaggedTransform(const DType* input,
                                         const IdType* lengths,
                                         uint32_t num_rows, uint32_t top_k_val,
                                         uint32_t max_len,
-                                        cudaStream_t stream = 0) {
+                                        cudaStream_t stream = 0,
+                                        int32_t* tie_flags = nullptr) {
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
   constexpr int MAX_VEC = 16 / sizeof(DType);
 
   dim3 grid(num_rows);
   dim3 block(FILTERED_TOPK_BLOCK_THREADS);
-  void* args[] = {&input,    &output_indices, &lengths,
-                  &num_rows, &top_k_val,      &max_len};
+  void* args[] = {&input,     &output_indices, &lengths,  &num_rows,
+                  &top_k_val, &max_len,        &tie_flags};
 
   const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
 
@@ -1371,9 +1389,11 @@ cudaError_t FilteredTopKRaggedTransform(const DType* input,
                                         const IdType* lengths,
                                         uint32_t num_rows, uint32_t top_k_val,
                                         uint32_t max_len,
-                                        cudaStream_t stream = 0) {
+                                        cudaStream_t stream = 0,
+                                        int32_t* tie_flags = nullptr) {
   return filtered_topk::FilteredTopKRaggedTransform<DType, IdType, MAX_K>(
-      input, output_indices, lengths, num_rows, top_k_val, max_len, stream);
+      input, output_indices, lengths, num_rows, top_k_val, max_len, stream,
+      tie_flags);
 }
 
 }  // namespace vllm

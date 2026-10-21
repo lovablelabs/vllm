@@ -480,14 +480,16 @@ void persistent_topk(const torch::stable::Tensor& logits,
                      const torch::stable::Tensor& lengths,
                      torch::stable::Tensor& output,
                      torch::stable::Tensor& workspace, int64_t k,
-                     int64_t max_seq_len);
+                     int64_t max_seq_len,
+                     std::optional<torch::stable::Tensor> const& tie_flags);
 
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
 void cooperative_topk(const torch::stable::Tensor& logits,
                       const torch::stable::Tensor& lengths,
                       torch::stable::Tensor& output,
                       torch::stable::Tensor& workspace, int64_t k,
-                      int64_t max_seq_len);
+                      int64_t max_seq_len,
+                      std::optional<torch::stable::Tensor> const& tie_flags);
 #endif
 
 void selective_scan_fwd(
