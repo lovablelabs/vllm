@@ -446,6 +446,8 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
                 decode_query_len,
                 block_indices[decode_slice],
+                query_positions=compressed_metadata.logical_positions[decode_slice],
+                out=out[decode_slice],
             )
 
         # Prefill requests follow the leading decode rows in the reordered batch.
@@ -464,14 +466,15 @@ class QSAIndexer(nn.Module):
                 block_indices[prefill_slice],
                 compressed_metadata.max_seq_len,
             )
-        expand_qsa_block_indices(
-            block_indices,
-            compressed_metadata.logical_positions[:num_tokens],
-            visible_blocks,
-            self.compress_ratio,
-            self.token_topk,
-            out,
-        )
+            # Decode rows were expanded by the selection itself.
+            expand_qsa_block_indices(
+                block_indices[prefill_slice],
+                compressed_metadata.logical_positions[prefill_slice],
+                visible_blocks[prefill_slice],
+                self.compress_ratio,
+                self.token_topk,
+                out[prefill_slice],
+            )
         return out, main_outputs
 
 
