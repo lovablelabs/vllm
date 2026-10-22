@@ -1172,7 +1172,34 @@ def override_envs_for_invariance():
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
 
+def enable_deterministic_serving() -> None:
+    """Row-invariant GEMMs and reductions for VLLM_DETERMINISTIC_SERVING.
+
+    A lighter subset of batch-invariant mode, enough for one TP group on SM90+:
+    cuBLASLt without split-K (no workspace), so every row count gets a kernel
+    with the same per-row reduction order, and the batch-invariant mean and
+    softmax kernels for ops that run eagerly (aten's reduce kernels choose
+    their split by row count). The NCCL, TF32 and bmm changes of
+    batch-invariant mode are not needed there and cost throughput.
+    """
+    global _batch_invariant_LIB
+    if _batch_invariant_LIB is not None:
+        return
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
+    if current_platform.is_cuda():
+        torch.backends.cuda.preferred_blas_library(backend="cublaslt")
+    _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
+    key = current_platform.dispatch_key
+    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, key)
+    _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, key)
+    _batch_invariant_LIB.impl("aten::softmax", softmax_batch_invariant, key)
+    _batch_invariant_LIB.impl("aten::_softmax", softmax_batch_invariant, key)
+
+
 def init_batch_invariance():
+    if envs.VLLM_DETERMINISTIC_SERVING and not envs.VLLM_BATCH_INVARIANT:
+        enable_deterministic_serving()
     # this will hit all the csrc overrides as well
     if envs.VLLM_BATCH_INVARIANT:
         resolve_tuned_matmul_configs()
