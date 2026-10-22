@@ -62,6 +62,7 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+from .ops.qsa import deterministic_serving
 
 
 class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
@@ -275,6 +276,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         output_gate: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        token_range: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -285,15 +287,16 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("QSA does not support sliding-window attention")
 
         num_tokens = attn_metadata.num_actual_tokens
-        output.zero_()
-        if num_tokens == 0:
+        start, end = token_range if token_range is not None else (0, num_tokens)
+        output[start:end].zero_()
+        if end <= start:
             return output
 
         topk_buffer = getattr(layer, "topk_indices_buffer", None)
         if topk_buffer is None:
             raise RuntimeError("QSA owner did not provide its top-k buffer")
-        logical_indices = topk_buffer[:num_tokens]
-        token_to_req = token_to_req[:num_tokens]
+        logical_indices = topk_buffer[start:end]
+        token_to_req = token_to_req[start:end]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         k_scale = v_scale = None
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
@@ -316,17 +319,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         from .ops.qsa import qsa_sparse_paged_attention
 
         qsa_sparse_paged_attention(
-            query[:num_tokens],
+            query[start:end],
             key_cache,
             value_cache,
             logical_indices,
             attn_metadata.block_table,
             token_to_req,
             use_prefill_config,
-            output[:num_tokens],
+            output[start:end],
             k_scale=k_scale,
             v_scale=v_scale,
-            output_gate=output_gate[:num_tokens],
+            output_gate=output_gate[start:end],
         )
         return output
 
@@ -604,18 +607,30 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         else:
             query, output_gate = main_outputs
         assert query is not None and output_gate is not None
-        impl.forward_qsa(
-            self,
-            query,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata,
-            output,
-            token_to_req=side_metadata.token_to_req,
-            use_prefill_config=main_metadata.max_query_len > self._max_decode_query_len,
-            output_gate=output_gate,
-        )
+        num_decode_tokens = side_metadata.num_decode_tokens
+        if deterministic_serving() and 0 < num_decode_tokens < num_tokens:
+            # A mixed step: decode and prefill rows on the configs they get in
+            # pure decode and pure prefill steps (decode rows come first).
+            ranges = [
+                ((0, num_decode_tokens), False),
+                ((num_decode_tokens, num_tokens), True),
+            ]
+        else:
+            ranges = [(None, main_metadata.max_query_len > self._max_decode_query_len)]
+        for token_range, use_prefill_config in ranges:
+            impl.forward_qsa(
+                self,
+                query,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata,
+                output,
+                token_to_req=side_metadata.token_to_req,
+                use_prefill_config=use_prefill_config,
+                output_gate=output_gate,
+                token_range=token_range,
+            )
 
     def forward(
         self,

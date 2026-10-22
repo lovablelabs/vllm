@@ -146,6 +146,15 @@ class GatedResidual(nn.Module):
 
         num_tokens = xn.shape[0]
         weight = self.input_mix_weight_down_block_inject.weight
+        if (
+            self._use_hc_down_silu
+            and envs.VLLM_DETERMINISTIC_SERVING
+            and num_tokens >= 1
+            and weight.shape[1] % HC_DOWN_SLICES == 0
+        ):
+            # The fused kernel picks its backend and split by row count; the
+            # sliced GEMM sums fixed K slices in a fixed order at any count.
+            return hc_down_silu_sliced(xn, weight, self.lora_rank, self.hc_count)
         if self._use_hc_down_silu and not envs.VLLM_BATCH_INVARIANT:
             if 1 <= num_tokens <= MAX_FUSED_M:
                 return hc_down_silu(xn, weight, self.lora_rank, self.hc_count)

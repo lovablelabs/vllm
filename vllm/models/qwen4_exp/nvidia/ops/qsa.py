@@ -8,6 +8,7 @@ from functools import lru_cache
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_scalar_specialization_rep,
@@ -576,6 +577,11 @@ def _select_sm100_fp8_config(
     return 32, 2, 1
 
 
+@lru_cache(maxsize=1)
+def deterministic_serving() -> bool:
+    return envs.VLLM_DETERMINISTIC_SERVING
+
+
 def _select_config(
     num_rows: int,
     num_kv_heads: int,
@@ -593,7 +599,13 @@ def _select_config(
     _select_sm100_fp8_config.
     """
     base_programs = num_rows * num_kv_heads
-    if _is_sm100() and is_fp8:
+    if deterministic_serving():
+        # One config for every batch size: the split count fixes the order the
+        # per-split partial softmaxes are merged in.
+        BLOCK_N, target_splits, num_warps = (
+            (32, 1, 1) if use_prefill_config else (32, 16, 1)
+        )
+    elif _is_sm100() and is_fp8:
         BLOCK_N, target_splits, num_warps = _select_sm100_fp8_config(
             base_programs, use_prefill_config
         )

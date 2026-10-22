@@ -389,6 +389,9 @@ def _runtime_ok(
 ) -> bool:
     return (
         not envs.VLLM_BATCH_INVARIANT
+        # Plans are per row count; deterministic serving needs one kernel per
+        # shape at every row count (cuBLASLt without split-K).
+        and not envs.VLLM_DETERMINISTIC_SERVING
         and x.dim() == 2
         and row_stride_ok(x, config)
         and _is_packed_row_major(weight)
@@ -408,7 +411,11 @@ class _Qwen4ExpLowLatencyApply:
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if bias is None and not envs.VLLM_BATCH_INVARIANT:
+        if (
+            bias is None
+            and not envs.VLLM_BATCH_INVARIANT
+            and not envs.VLLM_DETERMINISTIC_SERVING
+        ):
             return torch.ops.vllm.qwen4_exp_low_latency_gemm(x, layer.weight)
         return super().apply(layer, x, bias)  # type: ignore[misc]
 
