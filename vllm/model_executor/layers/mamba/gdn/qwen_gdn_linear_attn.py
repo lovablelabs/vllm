@@ -124,6 +124,11 @@ def _resolve_gdn_prefill_backend(
         else "auto"
     )
     backend = str(backend_cfg).strip().lower()
+    if envs.VLLM_DETERMINISTIC_SERVING and backend == "auto":
+        # FlashInfer's chunk-parallel prefill splits sequences into segments over
+        # the whole batch, so a sequence's output depends on what it shares the
+        # step with; the FLA Triton kernel works on each sequence alone.
+        return backend, "triton"
 
     head_k_dim = getattr(
         vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
