@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -178,6 +179,7 @@ class KVCacheManager:
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        self.prompt_blocks_only = envs.VLLM_DETERMINISTIC_SERVING
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused
         # junction costs a forward pass and displaces the block-boundary stop.
@@ -563,7 +565,10 @@ class KVCacheManager:
             # align-mode Mamba block is skipped as soon as the running state has
             # moved past it. Prefix hits are not in the request's blocks yet.
             self.coordinator.cache_blocks(
-                request, min(num_own_processed_tokens, request.num_tokens)
+                request,
+                self._num_cacheable_tokens(
+                    request, min(num_own_processed_tokens, request.num_tokens)
+                ),
             )
         self.coordinator.remove_skipped_blocks(
             request.request_id,
@@ -626,7 +631,9 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self.coordinator.cache_blocks(
+            request, self._num_cacheable_tokens(request, num_tokens_to_cache)
+        )
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -832,7 +839,17 @@ class KVCacheManager:
 
         """
         if self.enable_caching:
-            self.coordinator.cache_blocks(request, num_computed_tokens)
+            self.coordinator.cache_blocks(
+                request, self._num_cacheable_tokens(request, num_computed_tokens)
+            )
+
+    def _num_cacheable_tokens(self, request: Request, num_tokens: int) -> int:
+        # Deterministic serving caches prompt-token blocks only: blocks holding
+        # output tokens were computed by decode kernels, and a later turn that
+        # re-sends those tokens must prefill them as a cold server would.
+        if self.prompt_blocks_only:
+            return min(num_tokens, request.num_prompt_tokens)
+        return num_tokens
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

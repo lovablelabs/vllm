@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -325,6 +326,22 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        self.deterministic_serving = envs.VLLM_DETERMINISTIC_SERVING
+        # Deterministic serving: at most this many prefill chunks per step (0: any).
+        self.deterministic_max_prefills = envs.VLLM_DETERMINISTIC_MAX_PREFILLS
+        if self.deterministic_serving:
+            logger.info_once(
+                "Deterministic serving: block-aligned prefill chunks, at most %s "
+                "per step.",
+                self.deterministic_max_prefills or "any number",
+            )
+            if hash_block_size != block_size:
+                logger.warning_once(
+                    "Deterministic serving needs prefix-cache hits on whole KV "
+                    "blocks (hash block size %d != block size %d).",
+                    hash_block_size,
+                    block_size,
+                )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -439,6 +456,15 @@ class Scheduler(SchedulerInterface):
             {} if self.log_stats and self.connector is not None else None
         )
         self._kv_fetch_counts: dict[str, int] = dict.fromkeys(KV_FETCH_STAGES, 0)
+
+    def _block_aligned_prefill_chunk(self, start: int, num_new_tokens: int) -> int:
+        """Deterministic serving: end a prefill chunk at the next KV block boundary.
+
+        A block's KV (and recurrent state) then depends only on the tokens before
+        it, whether a cold prefill or a prefix-cache hit computes it.
+        """
+        block_size = self.cache_config.block_size
+        return min(num_new_tokens, block_size - start % block_size)
 
     def _mamba_block_aligned_split(
         self,
@@ -654,6 +680,15 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
 
+        # Deterministic serving: every prefill chunk is one KV block (or the
+        # prompt's tail), never cut short by the token budget.
+        num_deterministic_prefills = 0
+        deterministic_full_chunk = self.cache_config.block_size + 2 * (
+            1 + self.num_spec_tokens
+        )
+        if self.deterministic_serving:
+            long_prefill_token_threshold = 0
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -724,6 +759,21 @@ class Scheduler(SchedulerInterface):
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
+                )
+            if (
+                self.deterministic_serving
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                if min(
+                    token_budget, input_budget - draft_slots
+                ) < deterministic_full_chunk or (
+                    0 < self.deterministic_max_prefills <= num_deterministic_prefills
+                ):
+                    req_index += 1
+                    continue
+                num_deterministic_prefills += 1
+                num_new_tokens = self._block_aligned_prefill_chunk(
+                    request.num_computed_tokens, num_new_tokens
                 )
 
             # Schedule encoder inputs.
@@ -1191,6 +1241,21 @@ class Scheduler(SchedulerInterface):
                             # so drop the padding instead of shortening it.
                             num_new_tokens = 1
                             pad_spec_decode = False
+                    if (
+                        self.deterministic_serving
+                        and not pad_spec_decode
+                        and num_computed_tokens < request.num_prompt_tokens
+                    ):
+                        if request_token_budget < deterministic_full_chunk or (
+                            0
+                            < self.deterministic_max_prefills
+                            <= num_deterministic_prefills
+                        ):
+                            break
+                        num_deterministic_prefills += 1
+                        num_new_tokens = self._block_aligned_prefill_chunk(
+                            num_computed_tokens, num_new_tokens
+                        )
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
