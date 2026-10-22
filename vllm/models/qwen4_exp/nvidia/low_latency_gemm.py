@@ -21,6 +21,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
+from vllm.models.qwen4_exp.nvidia.ops.tma_gemm import (
+    TmaGemmConfig,
+    tma_gemm,
+    tma_gemm_ok,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -379,6 +384,34 @@ QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY: dict[
     (12, 1): QWEN4_EXP_SM121_GEMM_PLANS,
 }
 
+# Deterministic serving replaces the skinny plans (one kernel per row count)
+# with cuBLASLt without split-K. At a few rows cuBLASLt is slow on these
+# shapes; the TMA GEMM returns the same bits (one ascending-K accumulator), so
+# it serves those rows without changing any output. Times are B200 CUDA-graph
+# chains with the weights streaming from HBM.
+QWEN4_EXP_SM100_TMA_GEMM_PLANS: dict[tuple[int, int], TmaGemmConfig] = {
+    # Shared-expert gate: cuBLASLt takes 18-20 us at 2, 4 and 10 rows and
+    # changes its bits with the row count on some inputs; 4.6 us at every
+    # row count.
+    (1, 2560): TmaGemmConfig(1 << 30, 16, 512, 3, l2_prefetch=True),
+    # GDN fused B/A projection: 4.6 -> 4.2 us.
+    (48, 2560): TmaGemmConfig(32, 32, 512, 4, l2_prefetch=True),
+    # Router: 4.8-5.3 -> 4.2 us.
+    (512, 2560): TmaGemmConfig(32, 32, 512, 4, l2_prefetch=True),
+    # Shared-expert fused gate/up projection: 5.2-6.4 -> 4.2-4.3 us.
+    (640, 2560): TmaGemmConfig(32, 32, 512, 4, l2_prefetch=True),
+    # MTP embedding and hidden projections: 4.9-6.6 -> 4.5 us.
+    (1280, 2560): TmaGemmConfig(16, 32, 512, 4, l2_prefetch=True),
+    # GDN and QSA output projections: 8.2-9.3 -> 7.0 us.
+    (2560, 3072): TmaGemmConfig(8, 32, 512, 4, l2_prefetch=False),
+}
+
+QWEN4_EXP_TMA_GEMM_PLANS_BY_CAPABILITY: dict[
+    tuple[int, int] | None, dict[tuple[int, int], TmaGemmConfig]
+] = {
+    (10, 0): QWEN4_EXP_SM100_TMA_GEMM_PLANS,
+}
+
 
 def _is_packed_row_major(tensor: torch.Tensor) -> bool:
     return tensor.dim() == 2 and tensor.stride() == (tensor.shape[1], 1)
@@ -411,11 +444,9 @@ class _Qwen4ExpLowLatencyApply:
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if (
-            bias is None
-            and not envs.VLLM_BATCH_INVARIANT
-            and not envs.VLLM_DETERMINISTIC_SERVING
-        ):
+        if bias is None and not envs.VLLM_BATCH_INVARIANT:
+            if envs.VLLM_DETERMINISTIC_SERVING:
+                return torch.ops.vllm.qwen4_exp_tma_gemm(x, layer.weight)
             return torch.ops.vllm.qwen4_exp_low_latency_gemm(x, layer.weight)
         return super().apply(layer, x, bias)  # type: ignore[misc]
 
@@ -458,14 +489,47 @@ direct_register_custom_op(
 )
 
 
+def _tma_gemm_plan(weight: torch.Tensor) -> TmaGemmConfig | None:
+    plans = QWEN4_EXP_TMA_GEMM_PLANS_BY_CAPABILITY.get(
+        current_platform.get_device_capability(), {}
+    )
+    return plans.get((weight.shape[0], weight.shape[1]))
+
+
+def _qwen4_exp_tma_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # The TMA GEMM and cuBLASLt without split-K give the same bits, so the
+    # choice may depend on the row count (and on layout) freely.
+    config = _tma_gemm_plan(weight)
+    if (
+        config is not None
+        and x.dim() == 2
+        and 0 < x.shape[0] <= config.max_rows
+        and tma_gemm_ok(x, weight)
+    ):
+        return tma_gemm(x, weight, config, current_platform.is_arch_support_pdl())
+    return torch.nn.functional.linear(x, weight)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_tma_gemm",
+    op_func=_qwen4_exp_tma_gemm,
+    fake_impl=_qwen4_exp_low_latency_gemm_fake,
+)
+
+
 def enable_qwen4_exp_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
 ) -> None:
+    if dtype != torch.bfloat16 or envs.VLLM_BATCH_INVARIANT:
+        return
+    if envs.VLLM_DETERMINISTIC_SERVING:
+        _enable_qwen4_exp_tma_gemm(module, dtype)
+        return
     plans = QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.get(
         current_platform.get_device_capability(), {}
     )
-    if dtype != torch.bfloat16 or not plans:
+    if not plans:
         return
     if not shape_dynamic_skinny_gemm.is_available():
         return
@@ -496,3 +560,45 @@ def enable_qwen4_exp_low_latency_gemm(
 
     if warmup_configs:
         shape_dynamic_skinny_gemm.request_warmup_configs(dtype, warmup_configs)
+
+
+def _low_latency_gemm_layers(module: nn.Module):
+    for child in module.modules():
+        is_linear = (
+            isinstance(child, LinearBase)
+            and type(child.quant_method) is UnquantizedLinearMethod
+        )
+        is_head = (
+            isinstance(child, ParallelLMHead)
+            and type(child.quant_method) is UnquantizedEmbeddingMethod
+        )
+        weight = getattr(child, "weight", None)
+        if (is_linear or is_head) and weight is not None and weight.dim() == 2:
+            yield child, is_linear
+
+
+def _enable_qwen4_exp_tma_gemm(module: nn.Module, dtype: torch.dtype) -> None:
+    plans = QWEN4_EXP_TMA_GEMM_PLANS_BY_CAPABILITY.get(
+        current_platform.get_device_capability(), {}
+    )
+    if not plans:
+        return
+    warmed: set[tuple[int, int]] = set()
+    for child, is_linear in _low_latency_gemm_layers(module):
+        weight = child.weight
+        shape = (weight.shape[0], weight.shape[1])
+        config = plans.get(shape)
+        if config is None:
+            continue
+        if is_linear:
+            child.quant_method = Qwen4ExpLowLatencyLinearMethod()
+        else:
+            child.quant_method = Qwen4ExpLowLatencyEmbeddingMethod()
+        if shape in warmed or not weight.is_cuda:
+            continue
+        # Compile before CUDA graph capture; one variant covers every row
+        # count (the row count is not specialized).
+        x = torch.zeros((config.block_m, shape[1]), device=weight.device, dtype=dtype)
+        if tma_gemm_ok(x, weight):
+            tma_gemm(x, weight, config, current_platform.is_arch_support_pdl())
+            warmed.add(shape)
