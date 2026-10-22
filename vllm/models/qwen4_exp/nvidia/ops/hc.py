@@ -186,6 +186,16 @@ def _hc_down_silu_sliced(
     assert x.stride(1) == 1 and weight.is_contiguous()
     assert k % HC_DOWN_SLICES == 0 and rank + hc_count <= n
 
+    from .cute_dsl.hc_down_silu import (
+        hc_down_silu_sliced_mma,
+        hc_down_silu_sliced_mma_ok,
+    )
+
+    # Few rows: the same slices, partial order and epilogue in one clustered
+    # launch (same bits, so the choice may follow the row count).
+    if hc_down_silu_sliced_mma_ok(x, weight, HC_DOWN_SLICES):
+        return hc_down_silu_sliced_mma(x, weight, rank, hc_count, HC_DOWN_SLICES)
+
     slice_k = k // HC_DOWN_SLICES
     x_slices = x.unflatten(1, (HC_DOWN_SLICES, slice_k)).transpose(0, 1)
     w_slices = weight.view(n, HC_DOWN_SLICES, slice_k).permute(1, 2, 0)

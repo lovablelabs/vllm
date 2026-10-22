@@ -196,6 +196,118 @@ def hc_down_silu(
     return output[:, :rank], output[:, rank : rank + hc]
 
 
+# Deterministic serving's sliced HC down (ops/hc.py) in one clustered launch at
+# few rows: 8.2 -> 5.1-5.2 us on B200 up to 8 rows (bmm + reduce wins above).
+SLICED_MMA_MAX_M = 8
+
+
+class HcDownSiluSlicedGemm:
+    """Compile cache for the clustered HC down with the sliced HC down's bits.
+
+    One config serves every row count, so one compile covers the model.
+    """
+
+    def __init__(self, rank: int, hc: int, k: int, slices: int) -> None:
+        self.rank = rank
+        self.hc = hc
+        self.k = k
+        self.slices = slices
+        self._compiled: Any = None
+        self._warmup_registered = False
+
+    def compile(self) -> None:
+        if self._compiled is not None:
+            return
+
+        import cutlass.cute as cute
+        from cutlass import BFloat16
+        from quack.compile_utils import make_fake_tensor
+
+        from ._hc_down_silu_sliced_mma import HcDownSiluSlicedMma
+
+        M, N, K = cute.sym_int(), cute.sym_int(), cute.sym_int()
+        gemm = HcDownSiluSlicedMma(
+            tile_n=16,
+            tile_k=256,
+            num_stages=4,
+            split_k=self.slices,
+            rank=self.rank,
+            hc=self.hc,
+        )
+        self._compiled = cute.compile(
+            gemm,
+            make_fake_tensor(BFloat16, (M, K), divisibility=8),
+            make_fake_tensor(BFloat16, (N, K), divisibility=8),
+            make_fake_tensor(BFloat16, (M, N), divisibility=1),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+        logger.debug("Compiled hc_down_silu_sliced_mma: %d slices", self.slices)
+
+    def request_warmup(self) -> None:
+        if self._warmup_registered:
+            return
+        from vllm.model_executor.warmup.cutedsl_warmup import (
+            register_cutedsl_warmup_provider,
+        )
+
+        register_cutedsl_warmup_provider(self)
+        self._warmup_registered = True
+
+    def get_cutedsl_warmup_compile_units(self):
+        from vllm.model_executor.warmup.cutedsl_warmup import CuTeDSLCompileUnit
+
+        return (
+            CuTeDSLCompileUnit(
+                name="Qwen4Exp sliced HC down+SiLU GEMM",
+                key=(
+                    "qwen4-exp-hc-down-silu-sliced",
+                    self.rank,
+                    self.hc,
+                    self.k,
+                    self.slices,
+                ),
+                compile=self.compile,
+            ),
+        )
+
+    def __call__(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        self.compile()
+        n_compute = self.rank + self.hc
+        output = torch.empty(
+            x.shape[0], weight.shape[0], dtype=torch.bfloat16, device=x.device
+        )
+        self._compiled(x, weight[:n_compute], output[:, :n_compute])
+        return output
+
+
+@lru_cache
+def _get_sliced_kernel(rank: int, hc: int, k: int, slices: int) -> HcDownSiluSlicedGemm:
+    return HcDownSiluSlicedGemm(rank, hc, k, slices)
+
+
+def hc_down_silu_sliced_mma_ok(
+    x: torch.Tensor, weight: torch.Tensor, slices: int
+) -> bool:
+    """Whether the clustered kernel can serve this sliced HC down call."""
+    return (
+        current_platform.is_device_capability_family(100)
+        and x.dim() == 2
+        and x.shape[0] <= SLICED_MMA_MAX_M
+        and x.stride(1) == 1
+        and x.stride(0) % 8 == 0
+        and weight.is_contiguous()
+        and weight.shape[1] % (slices * 256) == 0
+    )
+
+
+def hc_down_silu_sliced_mma(
+    x: torch.Tensor, weight: torch.Tensor, rank: int, hc: int, slices: int
+) -> torch.Tensor:
+    """The sliced HC down ([M, N] bf16, pad columns unwritten) in one launch."""
+    return _get_sliced_kernel(rank, hc, weight.shape[1], slices)(x, weight)
+
+
 def request_hc_down_silu_warmup(
     m_values: Iterable[int], rank: int, hc: int, k: int
 ) -> None:
@@ -211,6 +323,19 @@ def request_hc_down_silu_warmup(
     """
     if not current_platform.has_device_capability(90) or k % 8 != 0:
         return
+    import vllm.envs as envs
+
+    if envs.VLLM_DETERMINISTIC_SERVING:
+        # Deterministic serving runs the sliced HC down at every row count; the
+        # fused kernels are never dispatched.
+        from ..hc import HC_DOWN_SLICES
+
+        if (
+            current_platform.is_device_capability_family(100)
+            and k % (HC_DOWN_SLICES * 256) == 0
+        ):
+            _get_sliced_kernel(rank, hc, k, HC_DOWN_SLICES).request_warmup()
+        return
     m_set = {int(m) for m in m_values if 1 <= m <= MAX_FUSED_M}
     # M=1 dispatches to the weight-prefetching PDL variant.
     _get_kernel(rank, hc, k, True).request_warmup(m_set & {1})
@@ -219,6 +344,9 @@ def request_hc_down_silu_warmup(
 
 __all__ = [
     "MAX_FUSED_M",
+    "SLICED_MMA_MAX_M",
     "hc_down_silu",
+    "hc_down_silu_sliced_mma",
+    "hc_down_silu_sliced_mma_ok",
     "request_hc_down_silu_warmup",
 ]
