@@ -498,6 +498,110 @@ def test_trtllm_fp4_moe_deferred_finalize(
         )
 
 
+@torch.inference_mode()
+def test_trtllm_fp4_moe_tactics_keep_token_bits(
+    monkeypatch: pytest.MonkeyPatch, workspace_init
+):
+    """Every tactic gives a token the same output bits at every token count.
+
+    Deterministic serving relies on it: the autotuner picks the tactic by
+    token-count bucket and by timing. Qwen4Exp's MoE shape at TP2.
+    """
+    from flashinfer.autotuner import AutoTuner
+
+    e, topk, n, k = 256, 10, 640, 2560
+    sizes = (1, 64, 256, 10752)
+    dtype = torch.bfloat16
+    forced: dict = {"tactic": None, "call": None}
+    choose_one = AutoTuner.choose_one
+
+    def choose_forced(self, op, runners, tuning_config, inputs, **kwargs):
+        if op.startswith("flashinfer::trtllm_fp4") and not self.is_tuning_mode:
+            forced["call"] = (runners[0], inputs)
+            if forced["tactic"] is not None:
+                return runners[0], forced["tactic"]
+        return choose_one(self, op, runners, tuning_config, inputs, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "choose_one", choose_forced)
+    set_random_seed(7)
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        w1_q, w2_q, quant_config = make_test_quant_config(
+            e, n, k, in_dtype=dtype, quant_dtype="nvfp4", is_scale_swizzled=False
+        )
+        w1_scale = torch.stack(
+            [
+                convert_swizzled_to_linear(s, w1_q.size(1), k, 16)
+                for s in quant_config.w1_scale
+            ]
+        )
+        w2_scale = torch.stack(
+            [
+                convert_swizzled_to_linear(s, w2_q.size(1), n, 16)
+                for s in quant_config.w2_scale
+            ]
+        )
+        w1_q, w1_scale = reorder_w1w3_to_w3w1(w1_q.clone(), w1_scale)
+        w1_q, w1_scale, w2_q, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
+            w1_q,
+            w2_q,
+            w1_scale,
+            w2_scale,
+            hidden_size=k,
+            intermediate_size=n,
+            num_experts=e,
+            is_gated_activation=True,
+        )
+        quant_config._w1.scale = w1_scale
+        quant_config._w2.scale = w2_scale
+        moe_config = FusedMoEConfig(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            num_local_experts=e,
+            num_logical_experts=e,
+            activation=MoEActivation.SILU,
+            device="cuda",
+            moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+            in_dtype=dtype,
+            routing_method=RoutingMethodType.TopK,
+            max_num_tokens=next_power_of_2(max(sizes)),
+        )
+        kernel = _make_trtllm_fp4_moe_kernel(moe_config, quant_config)
+        a = torch.randn((max(sizes), k), device="cuda", dtype=dtype) / 10
+        score = torch.randn((max(sizes), e), device="cuda", dtype=dtype)
+
+        def run(m, topk_weights, topk_ids):
+            return kernel.apply(
+                hidden_states=a[:m],
+                w1=w1_q,
+                w2=w2_q,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=e,
+                expert_map=None,
+                apply_router_weight_on_input=False,
+            )
+
+        first_token = None
+        for m in sizes:
+            routing = fused_topk(a[:m], score[:m], topk, renormalize=False)[:2]
+            forced["tactic"] = None
+            ref = run(m, *routing)
+            runner, inputs = forced["call"]
+            tactics = runner.get_valid_tactics(inputs, None)
+            assert len(tactics) > 1
+            if first_token is None:
+                first_token = ref[0].clone()
+            assert torch.equal(ref[0], first_token), m
+            for tactic in tactics:
+                forced["tactic"] = tactic
+                assert torch.equal(run(m, *routing), ref), (m, tactic)
+
+
 if __name__ == "__main__":
     test_trtllm_fp4_moe_no_graph(
         64,
