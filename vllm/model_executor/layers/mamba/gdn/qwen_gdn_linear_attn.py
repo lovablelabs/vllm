@@ -34,6 +34,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
@@ -293,6 +294,27 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
+def _deterministic_state_round_every(vllm_config) -> int:
+    """FLA chunks between bf16 roundings of the carried state, or 0.
+
+    Deterministic serving may prefill several whole KV blocks in one chunk; the
+    state cache then no longer rounds the recurrent state to bf16 at the inner
+    block boundaries, so the kernel does (block size a multiple of the chunk).
+    """
+    if not envs.VLLM_DETERMINISTIC_SERVING:
+        return 0
+    cache_config = vllm_config.cache_config
+    block_size = cache_config.block_size
+    if not block_size or block_size % FLA_CHUNK_SIZE:
+        return 0
+    _, ssm_dtype = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+        vllm_config.model_config.dtype,
+        cache_config.mamba_cache_dtype,
+        cache_config.mamba_ssm_cache_dtype,
+    )
+    return block_size // FLA_CHUNK_SIZE if ssm_dtype == torch.bfloat16 else 0
+
+
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
@@ -308,6 +330,14 @@ class ChunkGatedDeltaRule(CustomOp):
                 backend,
             )
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
+        self.state_round_every = _deterministic_state_round_every(vllm_config)
+        if self.state_round_every and active_backend != "triton":
+            logger.warning_once(
+                "Deterministic serving prefills several KV blocks per chunk, which "
+                "only the Triton/FLA GDN prefill reproduces exactly; the '%s' "
+                "backend can change outputs with the chunking.",
+                active_backend,
+            )
 
         if active_backend == "flashinfer":
             self._forward_method = self.forward_cuda
@@ -380,6 +410,7 @@ class ChunkGatedDeltaRule(CustomOp):
             chunk_offsets=chunk_offsets,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             core_attn_out=core_attn_out,
+            state_round_every=self.state_round_every,
         )
 
     def forward_cutedsl(

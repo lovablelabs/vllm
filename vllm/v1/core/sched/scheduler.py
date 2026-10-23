@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import torch
+
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
@@ -32,6 +34,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -80,6 +83,41 @@ from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# Chunk length of the FLA GDN prefill kernel (FLA_CHUNK_SIZE).
+_GDN_PREFILL_CHUNK_SIZE = 64
+
+
+def deterministic_multiblock_prefill(
+    kv_cache_config: KVCacheConfig, block_size: int
+) -> bool:
+    """Whether deterministic serving may prefill several KV blocks per chunk.
+
+    Only when every recurrent layer computes a multi-block chunk exactly as one
+    chunk per block: GDN layers on the FLA chunk kernel (64-token chunks, so the
+    block size must be a multiple of 64) with a bf16 state cache (the kernel
+    rounds the carried state at each block boundary, as the cache does between
+    chunks) or an fp32 one, and short convolutions (their state holds the last
+    inputs as they are). Models without GDN layers keep one block per chunk.
+    """
+    mamba_specs = [
+        group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    gdn = MambaAttentionBackendEnum.GDN_ATTN
+    return (
+        any(spec.mamba_type == gdn for spec in mamba_specs)
+        and block_size % _GDN_PREFILL_CHUNK_SIZE == 0
+        and all(
+            (
+                spec.mamba_type == gdn
+                and spec.dtypes[-1] in (torch.bfloat16, torch.float32)
+            )
+            or spec.mamba_type == MambaAttentionBackendEnum.SHORT_CONV
+            for spec in mamba_specs
+        )
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -342,6 +380,17 @@ class Scheduler(SchedulerInterface):
                     hash_block_size,
                     block_size,
                 )
+        self.deterministic_multiblock_prefill = (
+            self.deterministic_serving
+            and deterministic_multiblock_prefill(kv_cache_config, block_size)
+        )
+        if self.deterministic_serving:
+            logger.info_once(
+                "Deterministic serving: prefill chunks of %s.",
+                "whole KV blocks up to the token budget"
+                if self.deterministic_multiblock_prefill
+                else "one KV block",
+            )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -457,14 +506,24 @@ class Scheduler(SchedulerInterface):
         )
         self._kv_fetch_counts: dict[str, int] = dict.fromkeys(KV_FETCH_STAGES, 0)
 
-    def _block_aligned_prefill_chunk(self, start: int, num_new_tokens: int) -> int:
-        """Deterministic serving: end a prefill chunk at the next KV block boundary.
+    def _block_aligned_prefill_chunk(
+        self, start: int, num_new_tokens: int, prompt_end: int, budget: int
+    ) -> int:
+        """Deterministic serving: end a prefill chunk at a KV block boundary.
 
         A block's KV (and recurrent state) then depends only on the tokens before
-        it, whether a cold prefill or a prefix-cache hit computes it.
+        it, whether a cold prefill or a prefix-cache hit computes it. With
+        multi-block prefill the chunk covers as many whole blocks as the budget
+        allows (or reaches the prompt end); otherwise it is one block.
         """
         block_size = self.cache_config.block_size
-        return min(num_new_tokens, block_size - start % block_size)
+        first = block_size - start % block_size
+        if not self.deterministic_multiblock_prefill or num_new_tokens <= first:
+            return min(num_new_tokens, first)
+        limit = min(num_new_tokens, budget)
+        if start + limit >= prompt_end:
+            return min(limit, prompt_end - start)
+        return max((start + limit) // block_size * block_size - start, first)
 
     def _mamba_block_aligned_split(
         self,
@@ -773,7 +832,10 @@ class Scheduler(SchedulerInterface):
                     continue
                 num_deterministic_prefills += 1
                 num_new_tokens = self._block_aligned_prefill_chunk(
-                    request.num_computed_tokens, num_new_tokens
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                    request.num_prompt_tokens,
+                    min(token_budget, input_budget - draft_slots),
                 )
 
             # Schedule encoder inputs.
@@ -1254,7 +1316,10 @@ class Scheduler(SchedulerInterface):
                             break
                         num_deterministic_prefills += 1
                         num_new_tokens = self._block_aligned_prefill_chunk(
-                            num_computed_tokens, num_new_tokens
+                            num_computed_tokens,
+                            num_new_tokens,
+                            request.num_prompt_tokens,
+                            request_token_budget,
                         )
 
                     # Schedule encoder inputs.

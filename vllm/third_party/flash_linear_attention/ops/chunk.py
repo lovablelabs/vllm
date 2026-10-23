@@ -33,6 +33,7 @@ def chunk_gated_delta_rule_fwd(
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     core_attn_out: torch.Tensor | None = None,
+    state_round_every: int = 0,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=FLA_CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -68,6 +69,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        state_round_every=state_round_every,
     )
     o = chunk_fwd_o(
         q=q,
@@ -105,6 +107,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
         core_attn_out: torch.Tensor | None = None,
+        state_round_every: int = 0,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -123,6 +126,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             core_attn_out=core_attn_out,
+            state_round_every=state_round_every,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -149,6 +153,7 @@ def chunk_gated_delta_rule(
     chunk_offsets: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     core_attn_out: torch.Tensor | None = None,
+    state_round_every: int = 0,
 ):
     r"""
     Args:
@@ -174,6 +179,11 @@ def chunk_gated_delta_rule(
         cu_seqlens (torch.Tensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
+        state_round_every (int):
+            If > 0, round the carried recurrent state to bf16 every this many chunks
+            of each sequence, as a bf16 state cache between per-block calls would
+            (deterministic serving with prefill chunks spanning several KV blocks).
+            Default: `0`.
     Returns:
         o (torch.Tensor):
             Outputs of shape `[B, T, H, V]`.
@@ -241,5 +251,6 @@ def chunk_gated_delta_rule(
         chunk_offsets,
         use_qk_l2norm_in_kernel,
         core_attn_out,
+        state_round_every,
     )
     return o, final_state

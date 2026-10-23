@@ -68,6 +68,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    STATE_ROUND_EVERY: tl.constexpr = 0,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -131,6 +132,19 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # main recurrence
     for i_t in range(NT):
+        if STATE_ROUND_EVERY > 0:
+            # Round the carried state to bf16 every STATE_ROUND_EVERY chunks, as
+            # writing it to a bf16 state cache and reading it back between calls
+            # does, so one call over several KV blocks reproduces one call per
+            # block exactly (deterministic serving).
+            if i_t > 0 and i_t % STATE_ROUND_EVERY == 0:
+                b_h1 = b_h1.to(tl.bfloat16).to(tl.float32)
+                if K > 64:
+                    b_h2 = b_h2.to(tl.bfloat16).to(tl.float32)
+                if K > 128:
+                    b_h3 = b_h3.to(tl.bfloat16).to(tl.float32)
+                if K > 192:
+                    b_h4 = b_h4.to(tl.bfloat16).to(tl.float32)
         p_h1 = tl.make_block_ptr(
             h + i_t.to(tl.int64) * stride_h,
             (V, K),
@@ -331,6 +345,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     use_exp2: bool = False,
+    state_round_every: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -378,5 +393,6 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         USE_EXP2=use_exp2,
+        STATE_ROUND_EVERY=state_round_every,
     )
     return h, v_new, final_state

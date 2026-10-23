@@ -14,13 +14,22 @@ keeps the fast kernels and fixes only what changes numerics in a serving loop.
 VLLM_DETERMINISTIC_SERVING=1 vllm serve <model> ...
 ```
 
+On GDN models (Qwen3-Next, Qwen4Exp), pick a KV block size that is a multiple of 64, for example
+`--block-size 1792` instead of 1776: prefill chunks can then span whole blocks (see below), which
+roughly halves the cold-prefill cost per token compared with one block per chunk.
+
 ## What it changes
 
 Scheduling:
 
-- Prefill chunks end at KV block boundaries and are never cut short by the token budget, so a
-  block's KV and recurrent state depend only on the tokens before it, whether a cold prefill or a
-  prefix-cache hit produces them.
+- Prefill chunks start and end at KV block boundaries and are never cut short inside a block by
+  the token budget, so a block's KV and recurrent state depend only on the tokens before it,
+  whether a cold prefill or a prefix-cache hit produces them.
+- A chunk covers as many whole blocks as the token budget allows on GDN models when the block
+  size is a multiple of the FLA prefill kernel's 64-token chunk, the GDN state cache is bf16 (or
+  fp32) and any other recurrent layer is a short convolution: the kernel rounds its carried state
+  to bf16 at the inner block boundaries, exactly as storing it to the cache between one-block
+  chunks would. Otherwise each chunk is one block.
 - Only blocks made of prompt tokens are cached. Blocks holding output tokens were computed by
   decode kernels; a later turn that re-sends them prefills them as a cold server would.
 - `VLLM_DETERMINISTIC_MAX_PREFILLS` caps the prefill chunks per step (default 0: no cap). Decode
@@ -32,8 +41,9 @@ Kernels:
 - The batch-invariant `mean`, `softmax` and `log_softmax` kernels for ops that run eagerly.
 - GDN prefill on the FLA Triton kernel (per sequence) instead of FlashInfer's chunk-parallel one.
 - Qwen4Exp: QSA sparse attention on fixed split configs, with the decode and prefill rows of a
-  mixed step launched separately; no per-row-count skinny GEMM plans; the HC down projection on
-  the K-sliced GEMM at every row count.
+  mixed step launched separately; instead of the per-row-count skinny GEMM plans, a TMA GEMM with
+  cuBLASLt's bits at a few rows; the HC down projection on the K-sliced GEMM at every row count,
+  in one clustered launch at a few rows.
 
 ## Measured
 
