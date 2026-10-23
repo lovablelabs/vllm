@@ -16,7 +16,7 @@ VLLM_DETERMINISTIC_SERVING=1 vllm serve <model> ...
 
 On GDN models (Qwen3-Next, Qwen4Exp), pick a KV block size that is a multiple of 64, for example
 `--block-size 1792` instead of 1776: prefill chunks can then span whole blocks (see below), which
-roughly halves the cold-prefill cost per token compared with one block per chunk.
+cuts the time to first token of a cold prompt by about 30% compared with one block per chunk.
 
 ## What it changes
 
@@ -39,7 +39,11 @@ Kernels:
 
 - cuBLASLt without split-K: each output row is the same at any row count.
 - The batch-invariant `mean`, `softmax` and `log_softmax` kernels for ops that run eagerly.
-- GDN prefill on the FLA Triton kernel (per sequence) instead of FlashInfer's chunk-parallel one.
+- GDN prefill on the FLA Triton kernel (per sequence) instead of FlashInfer's chunk-parallel one,
+  autotuned at fixed warp counts: the warp count changes the bits of four of its kernels, and
+  autotuning picks by timing (often between near-equal timings), so a server could otherwise
+  answer with other bits than the last one. Tile sizes and pipeline stages stay autotuned; at
+  the fixed counts they leave the bits unchanged.
 - Qwen4Exp: QSA sparse attention on fixed split configs, with the decode and prefill rows of a
   mixed step launched separately; instead of the per-row-count skinny GEMM plans, a TMA GEMM with
   cuBLASLt's bits at a few rows; the HC down projection on the K-sliced GEMM at every row count,
@@ -47,19 +51,24 @@ Kernels:
 
 ## Measured
 
-Qwen4Exp NVFP4 with MTP (3 speculative tokens), TP2 x 2 replicas on B200, 80 agent prompts of
-27-95k tokens, greedy:
+Qwen4Exp NVFP4 with MTP (3 speculative tokens), TP2 x 2 replicas on B200, block size 1792, 80
+agent prompts of 27-95k tokens, greedy:
 
-- identical outputs at c1, c2, c16, c32, c64 and c128, cold vs cached, two boots, and turn 2 of a
-  conversation on a warm vs a fresh server;
-- throughput vs the default kernels: about -5% at c16 and -6 to -8% at c64-c128; single-request
-  TPOT +15% (the skinny GEMM plans are 2-3 us faster per GEMM at one or two requests); cold
-  prefill TTFT about +50%.
+- identical outputs at c1, c2, c16 and c64, cold vs cached, across boots that each autotune the
+  Triton kernels and the MoE on their own, with a boot that loads the tactic cache, and for turn
+  2 of a conversation on a warm vs a fresh server;
+- vs the default kernels in the same session: output throughput -8% at c2 (cached), -6% at c16,
+  -2% at c64; single-request TPOT +11% and time to first token +18% without prefix caching (the
+  default kernels' skinny GEMM plans are 2-3 us faster per GEMM at one or two requests, and their
+  prefill chunks are not held to block boundaries).
 
 ## Limits
 
 - Validated at TP2. A two-rank all-reduce is order-free; TP >= 4 also needs a one-stage
   all-reduce with a fixed reduction order (`VLLM_CUSTOM_ALLREDUCE_ALGO=1stage`), not tested here.
+- Validated on B200. The GDN prefill warp counts are fixed on every GPU, but that the tile and
+  stage choices left to autotuning keep the bits was checked on B200 only;
+  `tests/kernels/mamba/test_gdn_autotune_bits.py` checks it on the GPU it runs on.
 - Prefix-cache hits must land on whole KV blocks (hash block size equal to the block size).
 - A request preempted by recompute re-prefills its output tokens and may diverge from then on.
 - Logprobs of a scored prompt (prefill) and of the same tokens generated (decode) still come

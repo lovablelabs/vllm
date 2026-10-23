@@ -10,6 +10,10 @@
 
 import torch
 
+from vllm.triton_utils import triton
+
+from . import chunk_delta_h, chunk_o, chunk_scaled_dot_kkt
+from . import solve_tril as solve_tril_kernels
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -18,6 +22,36 @@ from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import FLA_CHUNK_SIZE, SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
+
+
+def pin_autotune_num_warps() -> None:
+    """Autotune the chunk kernels whose bits depend on the warp count at one count.
+
+    The kernels autotune by timing (once per machine and kernel source when
+    Triton caches the results), and several of these picks are timing ties at
+    the small warmup call they are tuned on. In these kernels the warp count
+    changes the output bits (the MMA layout of their dots; the k k^T dot is in
+    fp32 when beta is), so servers whose tuning picks differently give different
+    outputs for the same input; tile sizes and pipeline stages leave the bits
+    unchanged at these counts and stay tuned (at 2 warps the output kernel's
+    tile sizes change its bits too). The 2-warp k k^T and 64x64 inverse are the
+    fastest for prefill chunks of several thousand tokens on B200 (Qwen4Exp
+    shapes). For deterministic serving.
+    """
+    for kernel, num_warps in (
+        (chunk_delta_h.chunk_gated_delta_rule_fwd_kernel_h_blockdim64, 4),
+        (chunk_o.chunk_fwd_kernel_o, 4),
+        (chunk_scaled_dot_kkt.chunk_scaled_dot_kkt_fwd_kernel, 2),
+        (solve_tril_kernels.solve_tril_16x16_kernel, 2),
+        (solve_tril_kernels.merge_16x16_to_32x32_inverse_kernel, 2),
+        (solve_tril_kernels.merge_16x16_to_64x64_inverse_kernel, 2),
+    ):
+        while not isinstance(kernel, triton.runtime.autotuner.Autotuner):
+            kernel = kernel.fn
+        configs = [c for c in kernel.configs if c.num_warps == num_warps]
+        if configs and configs != kernel.configs:
+            kernel.configs = configs
+            kernel.cache.clear()
 
 
 def chunk_gated_delta_rule_fwd(

@@ -63,7 +63,10 @@ from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
 )
-from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
+from vllm.third_party.flash_linear_attention.ops.chunk import (
+    l2norm_fwd,
+    pin_autotune_num_warps,
+)
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -331,6 +334,10 @@ class ChunkGatedDeltaRule(CustomOp):
             )
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
         self.state_round_every = _deterministic_state_round_every(vllm_config)
+        if envs.VLLM_DETERMINISTIC_SERVING:
+            # Else a server whose autotuning picks another warp count for a GDN
+            # prefill kernel answers every request with other bits.
+            pin_autotune_num_warps()
         if self.state_round_every and active_backend != "triton":
             logger.warning_once(
                 "Deterministic serving prefills several KV blocks per chunk, which "
