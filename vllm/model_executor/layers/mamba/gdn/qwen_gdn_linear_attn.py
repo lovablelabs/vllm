@@ -42,6 +42,10 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_cp_deterministic import (
+    deterministic_cp_gated_delta_rule,
+    deterministic_cp_unavailable_reason,
+)
 from vllm.model_executor.layers.mamba.ops.gdn_state_pool import (
     fi_chunk_gated_delta_rule_pool,
     pool_mode_supported,
@@ -355,6 +359,30 @@ class ChunkGatedDeltaRule(CustomOp):
         else:
             self._forward_method = self.forward_native
 
+        # Deterministic serving with whole-block prefill chunks: FlashInfer's
+        # chunk-parallel kernels in segments of one KV block, which rounds the
+        # carried state at the block boundaries like the FLA kernel does.
+        self.deterministic_cp_segment = 0
+        if self.state_round_every and active_backend == "triton":
+            hf_config = vllm_config.model_config.hf_text_config
+            reason = deterministic_cp_unavailable_reason(
+                getattr(hf_config, "linear_key_head_dim", 0),
+                getattr(hf_config, "linear_value_head_dim", 0),
+            )
+            if reason is None:
+                self.deterministic_cp_segment = self.state_round_every * FLA_CHUNK_SIZE
+                self._forward_method = self.forward_deterministic_cp
+                logger.info_once(
+                    "Deterministic serving: GDN prefill on FlashInfer's "
+                    "chunk-parallel kernels in segments of one KV block."
+                )
+            else:
+                logger.warning_once(
+                    "Deterministic serving: GDN prefill on the FLA kernel; "
+                    "FlashInfer's faster chunk-parallel path %s.",
+                    reason,
+                )
+
     def forward_cuda(
         self,
         q: torch.Tensor,
@@ -387,6 +415,42 @@ class ChunkGatedDeltaRule(CustomOp):
             co_flat = core_attn_out.reshape(-1)
             co_flat[: o_flat.numel()].copy_(o_flat)
         return o, final_state
+
+    def forward_deterministic_cp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+        aiter_prefill_metadata: object | None = None,
+    ):
+        assert cu_seqlens is not None
+        if use_qk_l2norm_in_kernel:
+            q = l2norm_fwd(q)
+            k = l2norm_fwd(k)
+        o, final_state = deterministic_cp_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            cu_seqlens,
+            self.deterministic_cp_segment,
+        )
+        if core_attn_out is not None:
+            o_flat = o.squeeze(0).reshape(-1)
+            co_flat = core_attn_out.reshape(-1)
+            co_flat[: o_flat.numel()].copy_(o_flat)
+        return o, final_state if output_final_state else None
 
     def forward_native(
         self,

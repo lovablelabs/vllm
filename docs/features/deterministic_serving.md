@@ -39,11 +39,14 @@ Kernels:
 
 - cuBLASLt without split-K: each output row is the same at any row count.
 - The batch-invariant `mean`, `softmax` and `log_softmax` kernels for ops that run eagerly.
-- GDN prefill on the FLA Triton kernel (per sequence) instead of FlashInfer's chunk-parallel one,
-  autotuned at fixed warp counts: the warp count changes the bits of four of its kernels, and
-  autotuning picks by timing (often between near-equal timings), so a server could otherwise
-  answer with other bits than the last one. Tile sizes and pipeline stages stay autotuned; at
-  the fixed counts they leave the bits unchanged.
+- GDN prefill, on SM100 with whole-block chunks: FlashInfer's chunk-parallel kernels with their
+  segments set to the KV block and the sequential fixup between segments replaced by one that
+  rounds each block-end state to bf16, as the state cache does; a sequence's outputs then depend
+  only on its own tokens and the block boundaries. Elsewhere the FLA Triton kernel (per
+  sequence), autotuned at fixed warp counts: the warp count changes the bits of four of its
+  kernels, and autotuning picks by timing (often between near-equal timings), so a server could
+  otherwise answer with other bits than the last one. Tile sizes and pipeline stages stay
+  autotuned; at the fixed counts they leave the bits unchanged.
 - Qwen4Exp: QSA sparse attention on fixed split configs, with the decode and prefill rows of a
   mixed step launched separately; instead of the per-row-count skinny GEMM plans, a TMA GEMM with
   cuBLASLt's bits at a few rows; the HC down projection on the K-sliced GEMM at every row count,
@@ -57,10 +60,10 @@ agent prompts of 27-95k tokens, greedy:
 - identical outputs at c1, c2, c16 and c64, cold vs cached, across boots that each autotune the
   Triton kernels and the MoE on their own or load a saved autotune cache, and for turn 2 of a
   conversation on a warm vs a fresh server;
-- vs the default kernels in the same session: output throughput -7% at c2 (cached), -4% at c16,
-  unchanged at c64; single-request TPOT +10% and time to first token +14% without prefix caching
-  (the default kernels' skinny GEMM plans are 2-3 us faster per GEMM at one or two requests, and
-  their prefill chunks are not held to block boundaries).
+- vs the default kernels in the same session: output throughput -6% at c2 (cached) and at least
+  as high at c16 and c64; without prefix caching, time to first token +2% and single-request
+  TPOT +9% (the default kernels' skinny GEMM plans are 2-3 us faster per GEMM at one or two
+  requests).
 
 ## Limits
 
@@ -68,7 +71,9 @@ agent prompts of 27-95k tokens, greedy:
   all-reduce with a fixed reduction order (`VLLM_CUSTOM_ALLREDUCE_ALGO=1stage`), not tested here.
 - Validated on B200. The GDN prefill warp counts are fixed on every GPU, but that the tile and
   stage choices left to autotuning keep the bits was checked on B200 only;
-  `tests/kernels/mamba/test_gdn_autotune_bits.py` checks it on the GPU it runs on. The FlashInfer
+  `tests/kernels/mamba/test_gdn_autotune_bits.py` checks it on the GPU it runs on. The
+  chunk-parallel GDN prefill uses private FlashInfer 0.7 functions and falls back to the FLA kernel
+  when they are missing (`tests/kernels/mamba/test_gdn_cp_deterministic.py`). The FlashInfer
   TRTLLM FP4 MoE is left to its autotuner: every tactic gives a token the same bits at any batch
   size at Qwen4Exp's MoE shape on B200 (`test_trtllm_fp4_moe_tactics_keep_token_bits`).
 - Prefix-cache hits must land on whole KV blocks (hash block size equal to the block size).
