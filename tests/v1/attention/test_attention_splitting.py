@@ -460,3 +460,28 @@ def test_build_attention_metadata_zeros_stale_is_prefilling():
     assert not captured_is_prefilling[2]  # decode  (200 >= 200)
     assert not captured_is_prefilling[3]  # stale data (10 < 100) zeroed
     assert not captured_is_prefilling[4]  # stale data (20 < 200) zeroed
+
+
+def test_split_uniform_short_extend_kind_follows_its_request():
+    """A short prompt tail (3 tokens, below the 4-token MTP decode length) is
+    a decode alone but a prefill beside 4-token decodes when short extends
+    count as decodes; by its prefilling flag it is a prefill either way (what
+    deterministic serving's QSA metadata uses)."""
+    alone = apply_split_decodes_and_prefills([3], 4, True, is_prefilling=[True])
+    mixed = apply_split_decodes_and_prefills(
+        [4, 4, 3], 4, True, is_prefilling=[False, False, True]
+    )
+    assert alone == (1, 0, 3, 0)
+    assert mixed == (2, 1, 8, 3)
+    alone = apply_split_decodes_and_prefills(
+        [3], 4, True, is_prefilling=[True], treat_short_extends_as_decodes=False
+    )
+    mixed = apply_split_decodes_and_prefills(
+        [4, 4, 3],
+        4,
+        True,
+        is_prefilling=[False, False, True],
+        treat_short_extends_as_decodes=False,
+    )
+    assert alone == (0, 1, 0, 3)
+    assert mixed == (2, 1, 8, 3)

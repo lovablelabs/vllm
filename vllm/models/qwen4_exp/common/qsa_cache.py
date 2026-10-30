@@ -17,6 +17,8 @@ from functools import cache
 from typing import ClassVar
 
 import torch
+
+import vllm.envs as envs
 from torch import nn
 
 from vllm.config import CacheConfig, VllmConfig
@@ -663,6 +665,14 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
                 common_attn_metadata,
                 decode_threshold=decode_threshold,
                 require_uniform=True,
+                # Deterministic serving runs decode and prefill rows on their
+                # own configs, so a row's kind must follow its request alone:
+                # a short prompt tail is a prefill whether or not the step
+                # also holds decodes of another length.
+                treat_short_extends_as_decodes=not (
+                    envs.VLLM_DETERMINISTIC_SERVING
+                    and common_attn_metadata.is_prefilling is not None
+                ),
             )
         )
         assert num_decodes + num_prefills == common_attn_metadata.num_reqs

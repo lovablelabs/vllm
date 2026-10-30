@@ -609,12 +609,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             query, output_gate = main_outputs
         assert query is not None and output_gate is not None
         num_decode_tokens = side_metadata.num_decode_tokens
-        if deterministic_serving() and 0 < num_decode_tokens < num_tokens:
-            # A mixed step: decode and prefill rows on the configs they get in
-            # pure decode and pure prefill steps (decode rows come first).
+        if deterministic_serving():
+            # Decode rows (first) and prefill rows each on their own configs,
+            # by the requests' phase rather than the step's longest query, so
+            # a row's bits do not depend on the rest of the step.
             ranges = [
-                ((0, num_decode_tokens), False),
-                ((num_decode_tokens, num_tokens), True),
+                (token_range, use_prefill)
+                for token_range, use_prefill in (
+                    ((0, num_decode_tokens), False),
+                    ((num_decode_tokens, num_tokens), True),
+                )
+                if token_range[0] < token_range[1]
             ]
         else:
             ranges = [(None, main_metadata.max_query_len > self._max_decode_query_len)]
