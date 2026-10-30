@@ -322,6 +322,11 @@ def _deterministic_state_round_every(vllm_config) -> int:
     return block_size // FLA_CHUNK_SIZE if ssm_dtype == torch.bfloat16 else 0
 
 
+# (device, dtype, per-row shape) -> zeroed core attention output rows shared by
+# the layers of eager models; see QwenGatedDeltaNetAttention._core_attn_out.
+_ZEROED_CORE_ATTN_OUT: dict[tuple, torch.Tensor] = {}
+
+
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
@@ -585,8 +590,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
         reduce_results: bool = True,
         merge_in_proj: bool = False,
+        reuse_zeroed_output: bool = False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        # Eager models only: core attention writes into a slice of a buffer
+        # zeroed once and shared by every layer, instead of a fresh
+        # torch.zeros per layer (a memset kernel per layer in each CUDA graph).
+        # Rows the kernels skip (padding) keep finite values from earlier
+        # steps rather than zeros.
+        self._zeroed_output_rows = (
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            if reuse_zeroed_output
+            else 0
+        )
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
@@ -1143,6 +1159,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             return self.forward_cuda(hidden_states)
 
+    def _core_attn_out(self, num_tokens: int, dtype: torch.dtype, device: torch.device):
+        shape = (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim)
+        if 0 < num_tokens <= self._zeroed_output_rows:
+            key = (device, dtype, shape[1:])
+            buffer = _ZEROED_CORE_ATTN_OUT.get(key)
+            # Allocate outside graph capture so no graph replays the memset.
+            if buffer is None and not torch.cuda.is_current_stream_capturing():
+                buffer = torch.zeros(
+                    (self._zeroed_output_rows, *shape[1:]), dtype=dtype, device=device
+                )
+                _ZEROED_CORE_ATTN_OUT[key] = buffer
+            if buffer is not None:
+                return buffer[:num_tokens]
+        return torch.zeros(shape, dtype=dtype, device=device)
+
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
@@ -1164,10 +1195,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
         if use_fused_gdn_spec_decode:
-            core_attn_out = torch.zeros(
-                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
+            core_attn_out = self._core_attn_out(
+                num_tokens, hidden_states.dtype, hidden_states.device
             )
             torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
                 mixed_qkvz,
@@ -1200,10 +1229,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        core_attn_out = self._core_attn_out(
+            num_tokens, hidden_states.dtype, hidden_states.device
         )
 
         torch.ops.vllm.qwen_gdn_attention_core(

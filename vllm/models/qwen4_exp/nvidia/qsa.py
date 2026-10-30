@@ -288,7 +288,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
         num_tokens = attn_metadata.num_actual_tokens
         start, end = token_range if token_range is not None else (0, num_tokens)
-        output[start:end].zero_()
+        # qsa_sparse_paged_attention writes every element of output[start:end]
+        # (zeros for rows without a request), so the range needs no memset.
         if end <= start:
             return output
 

@@ -227,6 +227,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
                 merge_in_proj=True,
+                # The NVIDIA model runs eagerly (CUDA graphs, no torch.compile).
+                reuse_zeroed_output=True,
             )
         elif layer_type in _QSA_LAYER_TYPES:
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
