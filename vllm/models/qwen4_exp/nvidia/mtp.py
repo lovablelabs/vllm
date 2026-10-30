@@ -81,6 +81,65 @@ class _EagerGemmaRMSNorm(GemmaRMSNorm):
         return super().forward_cuda(x, residual)
 
 
+class _Fp8DraftHead:
+    """lm_head stand-in for LogitsProcessor: the shard's logits from an FP8
+    copy of its weight (per-row scales) and per-token FP8 activations.
+
+    The drafter's bf16 head GEMM streams the whole vocab shard every draft
+    step (B200, 124160 x 2560: 92 us at 1-16 rows); in FP8 it is 52 us."""
+
+    def __init__(self, lm_head: nn.Module) -> None:
+        from vllm import _custom_ops as ops
+
+        self._ops = ops
+        self.tp_size = lm_head.tp_size
+        self.shard_indices = lm_head.shard_indices
+        self.quant_method = self
+        weight = lm_head.weight
+        weight8 = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+        scale = torch.empty(weight.shape[0], dtype=torch.float32, device=weight.device)
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        for start in range(0, weight.shape[0], 8192):
+            rows = weight[start : start + 8192].float()
+            row_scale = rows.abs().amax(dim=1).clamp(min=1e-12) / fp8_max
+            weight8[start : start + 8192] = (rows / row_scale[:, None]).clamp(
+                -fp8_max, fp8_max
+            )
+            scale[start : start + 8192] = row_scale
+        # cutlass_scaled_mm takes B column-major ([K, N] view of the rows).
+        self.weight_t = weight8.t()
+        self.scale = scale.view(1, -1)
+
+    # cutlass_scaled_mm gives a row the same bits at 1-48 rows; its kernels
+    # for more rows differ (B200, this shape).
+    INVARIANT_ROWS = 48
+
+    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None):
+        assert bias is None
+        flat = x.reshape(-1, x.shape[-1])
+        x8, x_scale = self._ops.scaled_fp8_quant(flat, use_per_token_if_dynamic=True)
+        rows = self.INVARIANT_ROWS
+        if envs.VLLM_DETERMINISTIC_SERVING and flat.shape[0] > rows:
+            # Deterministic serving: every row on the small-batch kernels.
+            logits = torch.cat(
+                [
+                    self._ops.cutlass_scaled_mm(
+                        x8[start : start + rows],
+                        self.weight_t,
+                        x_scale[start : start + rows],
+                        self.scale,
+                        x.dtype,
+                    )
+                    for start in range(0, flat.shape[0], rows)
+                ]
+            )
+        else:
+            logits = self._ops.cutlass_scaled_mm(
+                x8, self.weight_t, x_scale, self.scale, x.dtype
+            )
+        return logits.reshape(*x.shape[:-1], -1)
+
+
 def _remap_ignored_layers(
     ignored_layers: list[str],
     mtp_start_layer_idx: int,
@@ -437,6 +496,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        if envs.VLLM_QWEN4_EXP_MTP_FP8_HEAD:
+            # Build the FP8 head in the first (profile) forward, ahead of any
+            # graph capture and of KV cache sizing.
+            self._draft_head()
         return self.model(
             input_ids,
             positions,
@@ -446,10 +509,24 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             spec_step_idx=spec_step_idx,
         )
 
+    def _draft_head(self) -> nn.Module:
+        if not envs.VLLM_QWEN4_EXP_MTP_FP8_HEAD:
+            return self.lm_head
+        head = getattr(self, "_fp8_head", None)
+        # The lm_head is shared with the target after loading; build the copy
+        # on first use (the profile run, before the KV cache is sized).
+        if head is None or head.source is not self.lm_head.weight:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("the FP8 draft head must be built before capture")
+            head = _Fp8DraftHead(self.lm_head)
+            head.source = self.lm_head.weight
+            self._fp8_head = head
+        return head
+
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        return self.logits_processor(self._draft_head(), hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():

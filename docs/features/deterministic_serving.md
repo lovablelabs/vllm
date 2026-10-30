@@ -18,6 +18,11 @@ On GDN models (Qwen3-Next, Qwen4Exp), pick a KV block size that is a multiple of
 `--block-size 1792` instead of 1776: prefill chunks can then span whole blocks (see below), which
 cuts the time to first token of a cold prompt by about 30% compared with one block per chunk.
 
+On Qwen4Exp with MTP, `VLLM_QWEN4_EXP_MTP_FP8_HEAD=1` also computes the drafter's logits from an
+FP8 copy of the lm_head shard (one more byte per weight per GPU): the draft step's largest GEMM
+takes 52 instead of 92 us on B200, and a row keeps its bits at any batch size. It changes the
+draft tokens, not the target's verification.
+
 ## What it changes
 
 Scheduling:
@@ -67,9 +72,10 @@ agent prompts of 27-95k tokens, greedy:
 - vs the default kernels in the same session: output throughput -6% at c2 (cached) and at least
   as high at c16 and c64; without prefix caching, time to first token +2% and single-request
   TPOT +9% (the default kernels' skinny GEMM plans are 2-3 us faster per GEMM at one or two
-  requests) before the QSA decode warp count followed the batch size and the one-kernel MTP
-  pre-norms, which take 80-110 us and 115 us (about 1.5% and 1.8%) off each decode step at one
-  request per replica.
+  requests) before the QSA decode warp count followed the batch size, the one-kernel MTP pre-norms
+  and the QSA decode fold tree, which take 80-110, 115 and 155 us (about 1.5%, 1.8% and 2.5%) off
+  each decode step at one request per replica; the tree costs 0.4-0.8% at 12-32 requests per
+  replica. `VLLM_QWEN4_EXP_MTP_FP8_HEAD=1` takes another 160 us (2.6%).
 
 ## Limits
 

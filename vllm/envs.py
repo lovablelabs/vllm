@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_DETERMINISTIC_SERVING: bool = False
     VLLM_DETERMINISTIC_MAX_PREFILLS: int = 0
+    VLLM_QWEN4_EXP_MTP_FP8_HEAD: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -647,6 +648,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 = no cap.
     "VLLM_DETERMINISTIC_MAX_PREFILLS": lambda: int(
         os.getenv("VLLM_DETERMINISTIC_MAX_PREFILLS", "0")
+    ),
+    # Qwen4Exp MTP drafter: logits through an FP8 (W8A8, per-row weight and
+    # per-token activation scales) copy of the shared lm_head shard, built once
+    # (+1 byte per weight per GPU). Changes draft tokens, not the target's.
+    "VLLM_QWEN4_EXP_MTP_FP8_HEAD": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_EXP_MTP_FP8_HEAD", "0"))
     ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
