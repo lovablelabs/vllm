@@ -51,7 +51,8 @@ Kernels:
   mixed step launched separately (the decode warp count follows the batch size: the softmax row
   sums go through the tensor cores, so the warp count leaves the bits unchanged); instead of the per-row-count skinny GEMM plans, a TMA GEMM with
   cuBLASLt's bits at a few rows; the HC down projection on the K-sliced GEMM at every row count,
-  in one clustered launch at a few rows.
+  in one clustered launch at a few rows; the MTP drafter's two pre-norms in one kernel each (the
+  NVIDIA model runs eagerly, where the native norm is eight to ten kernels).
 
 ## Measured
 
@@ -64,8 +65,9 @@ agent prompts of 27-95k tokens, greedy:
 - vs the default kernels in the same session: output throughput -6% at c2 (cached) and at least
   as high at c16 and c64; without prefix caching, time to first token +2% and single-request
   TPOT +9% (the default kernels' skinny GEMM plans are 2-3 us faster per GEMM at one or two
-  requests) before the QSA decode warp count followed the batch size, which takes 80-110 us
-  (about 1.5%) off each decode step at one request per replica.
+  requests) before the QSA decode warp count followed the batch size and the one-kernel MTP
+  pre-norms, which take 80-110 us and 115 us (about 1.5% and 1.8%) off each decode step at one
+  request per replica.
 
 ## Limits
 

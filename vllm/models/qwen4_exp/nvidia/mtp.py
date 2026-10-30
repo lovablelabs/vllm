@@ -20,6 +20,7 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -48,6 +49,7 @@ from vllm.sequence import IntermediateTensors
 
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+from .ops.gemma_rms_norm import gemma_rms_norm, gemma_rms_norm_supported
 from .model import (
     _EXTRA_WEIGHTS_MAPPER,
     _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
@@ -55,6 +57,28 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+
+
+class _EagerGemmaRMSNorm(GemmaRMSNorm):
+    """GemmaRMSNorm that takes one kernel under deterministic serving: this
+    model runs eagerly, where the native norm is eight to ten kernels."""
+
+    def _deterministic(self, x: torch.Tensor, residual: torch.Tensor | None) -> bool:
+        return (
+            residual is None
+            and envs.VLLM_DETERMINISTIC_SERVING
+            and gemma_rms_norm_supported(x, self.weight)
+        )
+
+    def forward_native(self, x, residual=None):
+        if self._deterministic(x, residual):
+            return gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        return super().forward_native(x, residual)
+
+    def forward_cuda(self, x, residual=None):
+        if self._deterministic(x, residual):
+            return gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        return super().forward_cuda(x, residual)
 
 
 def _remap_ignored_layers(
@@ -221,10 +245,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             "mlp",
         )
 
-        self.pre_fc_norm_embedding = GemmaRMSNorm(
+        self.pre_fc_norm_embedding = _EagerGemmaRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_fc_norm_hidden = GemmaRMSNorm(
+        self.pre_fc_norm_hidden = _EagerGemmaRMSNorm(
             self.hidden_size * self.hc_count, eps=config.rms_norm_eps
         )
         # HC final mixer collapses the multi stream into [T, H] for the LM head.
