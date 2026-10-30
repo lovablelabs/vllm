@@ -275,6 +275,10 @@ class HcDownSiluSlicedMma:
         num_stages = self.num_stages
         tidx, _, _ = cute.arch.thread_idx()
         bid_m, bid_n, bid_z = cute.arch.block_idx()
+        # Let the next kernel launch now: it prefetches its weights while this
+        # one runs, and its griddepcontrol.wait still waits for this grid.
+        if tidx == 0:
+            cute.arch.griddepcontrol_launch_dependents()
         warp_idx = cute.arch.warp_idx()
         lane_id = cute.arch.lane_idx()
         num_dma_warps: cutlass.Constexpr = self.num_dma_warps
@@ -527,9 +531,6 @@ class HcDownSiluSlicedMma:
 
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()  # peer DSMEM stores are now visible
-
-            if mma_tidx == 0:
-                cute.arch.griddepcontrol_launch_dependents()
             cute.arch.sync_threads()
 
             # Reduce split-K partials, apply the fused mHC SiLU epilogue, and
