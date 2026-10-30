@@ -69,13 +69,13 @@ agent prompts of 27-95k tokens, greedy:
 - identical outputs at c1, c2, c16 and c64, cold vs cached, across boots that each autotune the
   Triton kernels and the MoE on their own or load a saved autotune cache, and for turn 2 of a
   conversation on a warm vs a fresh server;
-- vs the default kernels in the same session: output throughput -6% at c2 (cached) and at least
-  as high at c16 and c64; without prefix caching, time to first token +2% and single-request
-  TPOT +9% (the default kernels' skinny GEMM plans are 2-3 us faster per GEMM at one or two
-  requests) before the QSA decode warp count followed the batch size, the one-kernel MTP pre-norms
-  and the QSA decode fold tree, which take 80-110, 115 and 155 us (about 1.5%, 1.8% and 2.5%) off
-  each decode step at one request per replica; the tree costs 0.4-0.8% at 12-32 requests per
-  replica. `VLLM_QWEN4_EXP_MTP_FP8_HEAD=1` takes another 160 us (2.6%).
+- vs the default kernels in the same session, both with `VLLM_QWEN4_EXP_MTP_FP8_HEAD=1`: output
+  throughput -1.5% at c2 (cached) and +3% cold at c2 (time to first token -9%, p99 1.5 s vs 5.0 s),
+  -2 to -4% at c16 and c64 against the mean of two default runs (which differ by 5-9% from each
+  other; the deterministic runs agree within 0.1%); single-request TPOT +2% (1.87 vs 1.83 ms). The
+  remaining decode cost is the GEMMs and the HC down projection at one or two requests per
+  replica, where the default kernels' per-row-count plans are 1-2 us faster per call, and the
+  QSA fold tree's 0.4-0.8% at 12-32 requests per replica.
 
 ## Limits
 
