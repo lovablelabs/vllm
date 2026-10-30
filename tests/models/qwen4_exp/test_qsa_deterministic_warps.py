@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Deterministic serving: QSA sparse decode attention gives the same bits at
-every warp count, so the warp count may follow the batch size."""
+"""Deterministic serving: the QSA split kernel (prefill rows) gives the same
+bits at every warp count."""
 
 import pytest
 import torch
@@ -50,7 +50,7 @@ def _attend(x, monkeypatch, deterministic: bool, warps: int | None = None):
         monkeypatch.setattr(qsa_ops, "_select_config", forced)
     try:
         return qsa_ops.qsa_sparse_paged_attention(
-            q, k, v, indices, table, token_to_req, False,
+            q, k, v, indices, table, token_to_req, True,
             k_scale=1.0, v_scale=1.0, output_gate=gate,
         )  # fmt: skip
     finally:

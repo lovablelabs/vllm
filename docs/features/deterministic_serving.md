@@ -48,8 +48,10 @@ Kernels:
   otherwise answer with other bits than the last one. Tile sizes and pipeline stages stay
   autotuned; at the fixed counts they leave the bits unchanged.
 - Qwen4Exp: QSA sparse attention on fixed split configs, with the decode and prefill rows of a
-  mixed step launched separately (the decode warp count follows the batch size: the softmax row
-  sums go through the tensor cores, so the warp count leaves the bits unchanged); instead of the per-row-count skinny GEMM plans, a TMA GEMM with
+  mixed step launched separately; decode rows give each 128-column leaf of the selection its own
+  softmax partial and fold the partials in one fixed tree, so the program count follows the batch
+  size without changing the bits (the softmax row sums go through the tensor cores, so the warp
+  count does not change them either); instead of the per-row-count skinny GEMM plans, a TMA GEMM with
   cuBLASLt's bits at a few rows; the HC down projection on the K-sliced GEMM at every row count,
   in one clustered launch at a few rows; the MTP drafter's two pre-norms in one kernel each (the
   NVIDIA model runs eagerly, where the native norm is eight to ten kernels).

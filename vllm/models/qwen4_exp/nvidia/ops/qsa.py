@@ -16,6 +16,16 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from .qsa_tree import (
+    LEAF as _TREE_LEAF,
+    NUM_LEAVES as _TREE_LEAVES,
+    _qsa_tree_kernel,
+    _qsa_tree_merge_kernel,
+    qsa_tree_attention,
+    qsa_tree_layout,
+    qsa_tree_supported,
+)
+
 
 @lru_cache(maxsize=1)
 def _is_sm120() -> bool:
@@ -729,6 +739,25 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
+    if (
+        deterministic_serving()
+        and not use_prefill_config
+        and qsa_tree_supported(selection_width, q.shape[2])
+    ):
+        # Decode rows: per-leaf partials in a fixed fold tree, so the program
+        # count may follow the batch size without changing the bits.
+        return qsa_tree_attention(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            out,
+            output_gate_view,
+            softmax_scale,
+            output_scale,
+        )
     block_n, partial_warps, num_tiles, num_splits = _select_config(
         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
     )
@@ -960,6 +989,77 @@ def warmup_qsa_sparse_paged_attention(
                 grid=(num_rows, num_query_heads),
             )
         warmed.append((block_n, num_splits, warps))
+    if deterministic_serving() and qsa_tree_supported(selection_width, head_dim):
+        layouts = {qsa_tree_layout(rows, num_kv_heads) for rows in range(1, 8193)}
+        for programs, warps in sorted(layouts):
+            has_tail = selection_width > _TREE_LEAF * _TREE_LEAVES
+            nodes = programs + int(has_tail)
+            node_m_ptr = TritonWarmupTensor(
+                torch.float32, shape=(nodes, num_rows, num_query_heads)
+            )
+            node_acc_ptr = TritonWarmupTensor(
+                torch.float32, shape=(nodes, num_rows, num_query_heads, head_dim)
+            )
+            _qsa_tree_kernel.warmup(
+                q_ptr,
+                k_cache_ptr,
+                v_cache_ptr,
+                indices_ptr,
+                block_table_ptr,
+                token_to_req_ptr,
+                node_m_ptr,
+                node_m_ptr,
+                node_acc_ptr,
+                1.0,
+                row_stride,
+                head_stride,
+                key_cache.stride(0),
+                key_cache.stride(1),
+                key_cache.stride(2),
+                value_cache.stride(0),
+                value_cache.stride(1),
+                value_cache.stride(2),
+                selection_width + 1,
+                block_table.stride(0),
+                num_rows,
+                num_cache_blocks,
+                num_requests,
+                TOPK=selection_width,
+                PAGE_SIZE=key_cache.shape[1],
+                PAGE_TABLE_WIDTH=block_table.shape[1],
+                GROUP_SIZE=group_size,
+                HEAD_DIM=head_dim,
+                NUM_QUERY_HEADS=num_query_heads,
+                LEAVES_PER_PROGRAM=_TREE_LEAVES // programs,
+                MAIN_PROGRAMS=programs,
+                BLOCK_M=block_m,
+                BLOCK_N=_TREE_LEAF,
+                IS_FP8=is_fp8,
+                num_warps=warps,
+                num_stages=2,
+                grid=(num_rows, num_kv_heads, nodes),
+            )
+            _qsa_tree_merge_kernel.warmup(
+                node_m_ptr,
+                node_m_ptr,
+                node_acc_ptr,
+                output_ptr,
+                output_gate_ptr,
+                1.0,
+                row_stride,
+                head_stride,
+                row_stride,
+                head_stride,
+                num_rows,
+                HEAD_DIM=head_dim,
+                NUM_QUERY_HEADS=num_query_heads,
+                NUM_NODES=programs,
+                HAS_TAIL=has_tail,
+                num_warps=4 if programs == _TREE_LEAVES else 2,
+                num_stages=1,
+                grid=(num_rows, num_query_heads),
+            )
+            warmed.append((_TREE_LEAF, programs, warps))
     return tuple(warmed)
 
 
