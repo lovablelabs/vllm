@@ -77,6 +77,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_FP8: tl.constexpr,
+    WARP_INVARIANT_SUM: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -177,12 +178,16 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             # softmax) so fp16 has the range, its wider mantissa is more
             # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
             values = values.to(tl.float16)
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
-        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+        p_values = probabilities.to(values.dtype)
+        accumulator = tl.dot(p_values, values, acc=accumulator * alpha[:, None])
+        if WARP_INVARIANT_SUM:
+            # Row sums of the rounded probabilities the P.V dot uses, on the
+            # tensor cores in a fixed K order: tl.sum's reduction tree follows
+            # the thread layout, so it changes with the warp count.
+            row_sums = tl.dot(p_values, tl.full(values.shape, 1.0, values.dtype))
+            normalizer = normalizer * alpha + tl.max(row_sums, axis=1)
+        else:
+            normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
 
     has_values = normalizer > 0
@@ -600,11 +605,15 @@ def _select_config(
     """
     base_programs = num_rows * num_kv_heads
     if deterministic_serving():
-        # One config for every batch size: the split count fixes the order the
-        # per-split partial softmaxes are merged in.
-        BLOCK_N, target_splits, num_warps = (
-            (32, 1, 1) if use_prefill_config else (32, 16, 1)
-        )
+        # One tile width and split count for every batch size: they fix the
+        # order the per-split partial softmaxes are merged in. The warp count
+        # leaves the bits unchanged (WARP_INVARIANT_SUM), so few-row batches,
+        # which would leave most SMs idle, get more warps per program.
+        if use_prefill_config:
+            BLOCK_N, target_splits, num_warps = 32, 1, 1
+        else:
+            BLOCK_N, target_splits = 32, 16
+            num_warps = 8 if base_programs <= 8 else 4 if base_programs <= 16 else 1
     elif _is_sm100() and is_fp8:
         BLOCK_N, target_splits, num_warps = _select_sm100_fp8_config(
             base_programs, use_prefill_config
@@ -782,6 +791,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         IS_FP8=is_fp8,
+        WARP_INVARIANT_SUM=deterministic_serving(),
         num_warps=partial_warps,
         num_stages=2,
     )
@@ -925,6 +935,7 @@ def warmup_qsa_sparse_paged_attention(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             IS_FP8=is_fp8,
+            WARP_INVARIANT_SUM=deterministic_serving(),
             num_warps=warps,
             num_stages=2,
             grid=(num_rows, num_kv_heads, num_splits),

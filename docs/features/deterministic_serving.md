@@ -48,7 +48,8 @@ Kernels:
   otherwise answer with other bits than the last one. Tile sizes and pipeline stages stay
   autotuned; at the fixed counts they leave the bits unchanged.
 - Qwen4Exp: QSA sparse attention on fixed split configs, with the decode and prefill rows of a
-  mixed step launched separately; instead of the per-row-count skinny GEMM plans, a TMA GEMM with
+  mixed step launched separately (the decode warp count follows the batch size: the softmax row
+  sums go through the tensor cores, so the warp count leaves the bits unchanged); instead of the per-row-count skinny GEMM plans, a TMA GEMM with
   cuBLASLt's bits at a few rows; the HC down projection on the K-sliced GEMM at every row count,
   in one clustered launch at a few rows.
 
@@ -63,7 +64,8 @@ agent prompts of 27-95k tokens, greedy:
 - vs the default kernels in the same session: output throughput -6% at c2 (cached) and at least
   as high at c16 and c64; without prefix caching, time to first token +2% and single-request
   TPOT +9% (the default kernels' skinny GEMM plans are 2-3 us faster per GEMM at one or two
-  requests).
+  requests) before the QSA decode warp count followed the batch size, which takes 80-110 us
+  (about 1.5%) off each decode step at one request per replica.
 
 ## Limits
 
