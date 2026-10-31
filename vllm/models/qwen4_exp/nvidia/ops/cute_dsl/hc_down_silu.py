@@ -199,6 +199,9 @@ def hc_down_silu(
 # Deterministic serving's sliced HC down (ops/hc.py) in one clustered launch at
 # few rows: 8.2 -> 5.1-5.2 us on B200 up to 8 rows (bmm + reduce wins above).
 SLICED_MMA_MAX_M = 8
+# Pipeline stages of the clustered kernel: a whole 1280-column slice (5 tiles
+# of 256) for Qwen4Exp's 10240-wide HC down.
+SLICED_MMA_STAGES = 5
 
 
 class HcDownSiluSlicedGemm:
@@ -229,8 +232,9 @@ class HcDownSiluSlicedGemm:
         gemm = HcDownSiluSlicedMma(
             tile_n=16,
             tile_k=256,
-            num_stages=4,
+            num_stages=SLICED_MMA_STAGES,
             split_k=self.slices,
+            prefetch_b=True,
             rank=self.rank,
             hc=self.hc,
         )
@@ -298,6 +302,9 @@ def hc_down_silu_sliced_mma_ok(
         and x.stride(0) % 8 == 0
         and weight.is_contiguous()
         and weight.shape[1] % (slices * 256) == 0
+        # Every K tile of a slice is in flight at once (weights before the PDL
+        # wait).
+        and weight.shape[1] // (slices * 256) <= SLICED_MMA_STAGES
     )
 
 

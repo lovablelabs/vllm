@@ -99,7 +99,12 @@ class HcDownSiluSlicedMma:
         rank: int = 320,
         hc: int = 4,
         num_mma_warps: int = 1,
+        prefetch_b: bool = False,
     ):
+        # prefetch_b: issue every B (weight) tile of the CTA's K slice before
+        # griddepcontrol.wait, as the weights do not depend on the previous
+        # kernel; needs K / (split_k * tile_k) <= num_stages.
+        self.prefetch_b = prefetch_b
         self.ab_dtype = ab_dtype
         self.acc_dtype = acc_dtype
         self.rank = rank
@@ -359,44 +364,74 @@ class HcDownSiluSlicedMma:
                 pipeline.PipelineUserType.Producer, num_stages
             )
 
-            # Prime the first pipeline stage.
-            mainloop_pipeline.producer_acquire(producer_state)
-            cute.copy(
-                tiled_copy_B,
-                tBgB[None, None, None, k_start],
-                tBsB[None, None, None, producer_state.index],
-                pred=tBpB,
-            )
-            cute.arch.griddepcontrol_wait()
-            cute.copy(
-                tiled_copy_A,
-                tAgA[None, None, None, k_start],
-                tAsA[None, None, None, producer_state.index],
-                pred=tApA,
-            )
-            mainloop_pipeline.producer_commit(producer_state)
-            producer_state.advance()
-
-            for k_tile in cutlass.range(
-                k_start + 1, k_start + num_k_tiles, 1, unroll=1
-            ):
-                self._fill_pred(tApA_flat, tAcA, k_tile, mA.shape[0], K_total)
-                self._fill_pred(tBpB_flat, tBcB, k_tile, mB.shape[0], K_total)
+            if cutlass.const_expr(self.prefetch_b):
+                b_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, num_stages
+                )
+                for k_tile in cutlass.range(
+                    k_start, k_start + num_k_tiles, 1, unroll=1
+                ):
+                    self._fill_pred(tBpB_flat, tBcB, k_tile, mB.shape[0], K_total)
+                    mainloop_pipeline.producer_acquire(b_state)
+                    cute.copy(
+                        tiled_copy_B,
+                        tBgB[None, None, None, k_tile],
+                        tBsB[None, None, None, b_state.index],
+                        pred=tBpB,
+                    )
+                    b_state.advance()
+                cute.arch.griddepcontrol_wait()
+                for k_tile in cutlass.range(
+                    k_start, k_start + num_k_tiles, 1, unroll=1
+                ):
+                    self._fill_pred(tApA_flat, tAcA, k_tile, mA.shape[0], K_total)
+                    cute.copy(
+                        tiled_copy_A,
+                        tAgA[None, None, None, k_tile],
+                        tAsA[None, None, None, producer_state.index],
+                        pred=tApA,
+                    )
+                    mainloop_pipeline.producer_commit(producer_state)
+                    producer_state.advance()
+            else:
+                # Prime the first pipeline stage.
                 mainloop_pipeline.producer_acquire(producer_state)
                 cute.copy(
-                    tiled_copy_A,
-                    tAgA[None, None, None, k_tile],
-                    tAsA[None, None, None, producer_state.index],
-                    pred=tApA,
-                )
-                cute.copy(
                     tiled_copy_B,
-                    tBgB[None, None, None, k_tile],
+                    tBgB[None, None, None, k_start],
                     tBsB[None, None, None, producer_state.index],
                     pred=tBpB,
                 )
+                cute.arch.griddepcontrol_wait()
+                cute.copy(
+                    tiled_copy_A,
+                    tAgA[None, None, None, k_start],
+                    tAsA[None, None, None, producer_state.index],
+                    pred=tApA,
+                )
                 mainloop_pipeline.producer_commit(producer_state)
                 producer_state.advance()
+
+                for k_tile in cutlass.range(
+                    k_start + 1, k_start + num_k_tiles, 1, unroll=1
+                ):
+                    self._fill_pred(tApA_flat, tAcA, k_tile, mA.shape[0], K_total)
+                    self._fill_pred(tBpB_flat, tBcB, k_tile, mB.shape[0], K_total)
+                    mainloop_pipeline.producer_acquire(producer_state)
+                    cute.copy(
+                        tiled_copy_A,
+                        tAgA[None, None, None, k_tile],
+                        tAsA[None, None, None, producer_state.index],
+                        pred=tApA,
+                    )
+                    cute.copy(
+                        tiled_copy_B,
+                        tBgB[None, None, None, k_tile],
+                        tBsB[None, None, None, producer_state.index],
+                        pred=tBpB,
+                    )
+                    mainloop_pipeline.producer_commit(producer_state)
+                    producer_state.advance()
 
             mainloop_pipeline.producer_tail(producer_state)
 

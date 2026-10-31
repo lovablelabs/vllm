@@ -402,6 +402,9 @@ def _hc_combine_norm_kernel(
     w_offs = offs_inner if W_SHARED else offs
 
     if launch_pdl:
+        # The next kernel (the HC down) may start now and fetch its weights;
+        # its griddepcontrol.wait still waits for this grid.
+        tl.extra.cuda.gdc_launch_dependents()
         tl.extra.cuda.gdc_wait()
 
     # Start the uncached residual load first, then issue the other combine
@@ -427,9 +430,6 @@ def _hc_combine_norm_kernel(
     out = out.to(tl.float32)
     sum_sq = tl.sum(tl.sum(out * out, axis=1), axis=0)
     rrms = tl.rsqrt(sum_sq / HC_DIM + EPS)
-
-    if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
 
     if inj_ptr is not None:
         # Loading the weight earlier helps decode but keeps the tile live across
