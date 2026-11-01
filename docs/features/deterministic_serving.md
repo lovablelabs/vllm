@@ -70,12 +70,20 @@ agent prompts of 27-95k tokens, greedy:
   Triton kernels and the MoE on their own or load a saved autotune cache, and for turn 2 of a
   conversation on a warm vs a fresh server;
 - vs the default kernels in the same session, both with `VLLM_QWEN4_EXP_MTP_FP8_HEAD=1`: output
-  throughput -1.5% at c2 (cached) and +3% cold at c2 (time to first token -9%, p99 1.5 s vs 5.0 s),
-  -2 to -4% at c16 and c64 against the mean of two default runs (which differ by 5-9% from each
-  other; the deterministic runs agree within 0.1%); single-request TPOT +2% (1.87 vs 1.83 ms). The
-  remaining decode cost is the GEMMs and the HC down projection at one or two requests per
-  replica, where the default kernels' per-row-count plans are 1-2 us faster per call, and the
-  QSA fold tree's 0.4-0.8% at 12-32 requests per replica.
+  throughput -0.2% at c2 (cached) and +4% cold at c2 (time to first token -10%), +4% at c16 and
+  +0-2% at c64, where the default kernels accept 0.02-0.08 fewer draft tokens per step (their
+  numerics change with the batch); single-request TPOT +1% (1.83 vs 1.81 ms). A decode step with
+  one request per replica takes 5.73 vs 5.62 ms (+2%): the target forward is 0.18 ms slower, the
+  draft 0.05 ms faster.
+
+Most of the forward's remaining 0.18 ms is the GEMMs at a few rows. A GEMM with cuBLASLt's bits
+accumulates each output in one ascending chain of 16-deep MMA steps, and on B200 a dependent step
+costs about 17 ns on the mma.sync and tcgen05 tensor cores alike (0.55 us per 512 of K), so a call
+takes about K/16 x 17 ns plus 1.5 us. The TMA GEMM runs at that bound (3.6-3.8 us of MMA at
+K = 2560) and a tcgen05 GEMM (QuACK) gives the same bits no faster. The default skinny plans are
+faster because they spread each output's K over a block of threads and sum it in a tree, which
+gives other bits. The sliced HC down costs about 0.6 us per layer more than the fused kernel at
+four rows, and the QSA fold tree 0.4-0.8% at 12-32 requests per replica.
 
 ## Limits
 
