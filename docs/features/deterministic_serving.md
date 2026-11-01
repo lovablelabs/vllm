@@ -21,7 +21,9 @@ cuts the time to first token of a cold prompt by about 30% compared with one blo
 On Qwen4Exp with MTP, `VLLM_QWEN4_EXP_MTP_FP8_HEAD=1` also computes the drafter's logits from an
 FP8 copy of the lm_head shard (one more byte per weight per GPU): the draft step's largest GEMM
 takes 52 instead of 92 us on B200, and a row keeps its bits at any batch size. It changes the
-draft tokens, not the target's verification.
+draft tokens, not the target's verification. Greedy outputs can still follow the drafts in a few
+cases (2 of 80 agent prompts changed when only the drafter's numerics did), so a change to the
+drafter or to this flag can change some outputs; for a given setting they stay identical.
 
 ## What it changes
 
@@ -58,8 +60,9 @@ Kernels:
   size without changing the bits (the softmax row sums go through the tensor cores, so the warp
   count does not change them either); instead of the per-row-count skinny GEMM plans, a TMA GEMM with
   cuBLASLt's bits at a few rows; the HC down projection on the K-sliced GEMM at every row count,
-  in one clustered launch at a few rows; the MTP drafter's two pre-norms in one kernel each (the
-  NVIDIA model runs eagerly, where the native norm is eight to ten kernels).
+  in one clustered launch at a few rows, also for the MTP drafter's final mixer; the MTP drafter's
+  two pre-norms in one kernel each (the NVIDIA model runs eagerly, where the native norm is eight
+  to ten kernels).
 
 ## Measured
 
@@ -70,13 +73,12 @@ agent prompts of 27-95k tokens, greedy:
   Triton kernels and the MoE on their own or load a saved autotune cache, and for turn 2 of a
   conversation on a warm vs a fresh server;
 - vs the default kernels in the same session, both with `VLLM_QWEN4_EXP_MTP_FP8_HEAD=1`: output
-  throughput -0.2% at c2 (cached) and +4% cold at c2 (time to first token -10%), +4% at c16 and
-  +0-2% at c64, where the default kernels accept 0.02-0.08 fewer draft tokens per step (their
-  numerics change with the batch); single-request TPOT +1% (1.83 vs 1.81 ms). A decode step with
-  one request per replica takes 5.73 vs 5.62 ms (+2%): the target forward is 0.18 ms slower, the
-  draft 0.05 ms faster.
+  throughput -1% at c2 (cached) and +5% cold at c2 (time to first token -10%), even at c16 and -3%
+  at c64 (the default runs differ by up to 10% between repeats there, the deterministic ones by
+  0.5%); single-request TPOT +2% (1.80 vs 1.76 ms). A decode step with one request per replica
+  takes 5.64 vs 5.57 ms (+1%): the target forward is 0.15 ms slower, the draft 0.08 ms faster.
 
-Most of the forward's remaining 0.18 ms is the GEMMs at a few rows. A GEMM with cuBLASLt's bits
+Most of the forward's remaining 0.15 ms is the GEMMs at a few rows. A GEMM with cuBLASLt's bits
 accumulates each output in one ascending chain of 16-deep MMA steps, and on B200 a dependent step
 costs about 17 ns on the mma.sync and tcgen05 tensor cores alike (0.55 us per 512 of K), so a call
 takes about K/16 x 17 ns plus 1.5 us. The TMA GEMM runs at that bound (3.6-3.8 us of MMA at
