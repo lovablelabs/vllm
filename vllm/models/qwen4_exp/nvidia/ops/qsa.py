@@ -88,7 +88,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_N: tl.constexpr,
     IS_FP8: tl.constexpr,
     WARP_INVARIANT_SUM: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ) -> None:
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
     split_id = tl.program_id(2)
@@ -270,7 +275,12 @@ def _qsa_merge_splitk_kernel(
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ) -> None:
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+
     row = tl.program_id(0)
     head = tl.program_id(1)
     split_offsets = tl.arange(0, BLOCK_SPLITS)
@@ -823,6 +833,7 @@ def qsa_sparse_paged_attention(
         WARP_INVARIANT_SUM=deterministic_serving(),
         num_warps=partial_warps,
         num_stages=2,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     if num_splits == 1:
         return out
@@ -843,6 +854,7 @@ def qsa_sparse_paged_attention(
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
         num_warps=2,
         num_stages=1,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return out
 
@@ -968,6 +980,7 @@ def warmup_qsa_sparse_paged_attention(
             num_warps=warps,
             num_stages=2,
             grid=(num_rows, num_kv_heads, num_splits),
+            launch_pdl=current_platform.is_arch_support_pdl(),
         )
         if num_splits > 1:
             _qsa_merge_splitk_kernel.warmup(
@@ -987,6 +1000,7 @@ def warmup_qsa_sparse_paged_attention(
                 num_warps=2,
                 num_stages=1,
                 grid=(num_rows, num_query_heads),
+                launch_pdl=current_platform.is_arch_support_pdl(),
             )
         warmed.append((block_n, num_splits, warps))
     if deterministic_serving() and qsa_tree_supported(selection_width, head_dim):
@@ -1038,6 +1052,7 @@ def warmup_qsa_sparse_paged_attention(
                 num_warps=warps,
                 num_stages=2,
                 grid=(num_rows, num_kv_heads, nodes),
+                launch_pdl=current_platform.is_arch_support_pdl(),
             )
             _qsa_tree_merge_kernel.warmup(
                 node_m_ptr,
@@ -1058,6 +1073,7 @@ def warmup_qsa_sparse_paged_attention(
                 num_warps=4 if programs == _TREE_LEAVES else 2,
                 num_stages=1,
                 grid=(num_rows, num_query_heads),
+                launch_pdl=current_platform.is_arch_support_pdl(),
             )
             warmed.append((_TREE_LEAF, programs, warps))
     return tuple(warmed)

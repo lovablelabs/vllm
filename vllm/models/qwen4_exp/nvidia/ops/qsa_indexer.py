@@ -36,7 +36,12 @@ def _qsa_mqa_paged_uniform_kernel(
     BLOCK_N: tl.constexpr,
     TILES_PER_PROG: tl.constexpr,
     STAGES: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ) -> None:
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+
     NUM_COLUMNS: tl.constexpr = PAGE_TABLE_WIDTH * PAGE_SIZE
     DECODE_QUERY_LEN_PADDED: tl.constexpr = triton.next_power_of_2(DECODE_QUERY_LEN)
     NUM_HEADS_PADDED: tl.constexpr = triton.next_power_of_2(NUM_HEADS)
@@ -373,6 +378,7 @@ def warmup_qsa_mqa_paged_decode(
                 num_requests,
                 triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
             ),
+            launch_pdl=current_platform.is_arch_support_pdl(),
         )
     return profiles
 
@@ -642,9 +648,14 @@ def _canonicalize_expand_kernel(
     COMPRESS_RATIO: tl.constexpr,
     BLOCK: tl.constexpr,
     UNROLL: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ):
     """_canonicalize_topk_kernel followed by _expand_qsa_indices_kernel for
     one row, from registers: one launch instead of two on decode steps."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+
     OUTPUT_WIDTH: tl.constexpr = K * COMPRESS_RATIO + COMPRESS_RATIO - 1
     row = tl.program_id(0)
     visible = tl.load(visible_ptr + row)
@@ -775,6 +786,7 @@ def _canonicalize_expand(
         BLOCK=block,
         UNROLL=unroll,
         num_warps=num_warps,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
 
 
@@ -845,6 +857,7 @@ def qsa_select_paged_decode(
         STAGES=2,
         # tuned on GB300
         num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     tie_flags = _topk(
         logits,

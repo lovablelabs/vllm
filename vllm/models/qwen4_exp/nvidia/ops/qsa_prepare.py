@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -171,7 +172,12 @@ def _qsa_prepare_kernel(
     MAIN_HK: tl.constexpr,
     MAIN_D: tl.constexpr,
     MAIN_PAGE_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+
     pid = tl.program_id(0)
     num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
     if pid >= num_index_work:
@@ -643,6 +649,7 @@ def qsa_prepare(
         MAIN_D=main_head_dim,
         MAIN_PAGE_SIZE=main_kv_cache.shape[1],
         num_warps=1,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return main_q_out, main_gate_out
 

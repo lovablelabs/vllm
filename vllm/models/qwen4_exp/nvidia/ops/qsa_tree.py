@@ -23,6 +23,7 @@ leaves the bits unchanged too. Prefill rows keep the split kernel.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 LEAF = 128
@@ -195,10 +196,15 @@ def _qsa_tree_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_FP8: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ):
     """One leaf or one level-1 node (four leaves) per program, stored for the
     merge kernel; program MAIN_PROGRAMS (when the selection has a tail) takes
     the tail leaf."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
     program = tl.program_id(2)
@@ -316,12 +322,17 @@ def _qsa_tree_merge_kernel(
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_NODES: tl.constexpr,
     HAS_TAIL: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ):
     """Fold one (row, query head)'s stored leaves (16) or level-1 nodes (4) up
     the tree, then the tail leaf (node NUM_NODES), normalize, round to bf16 and
     apply the sigmoid output gate. All nodes load up front; each level folds
     across its groups at once (the same per-element operations in the same
     order as one leaf at a time)."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+
     row = tl.program_id(0)
     head = tl.program_id(1)
     dims = tl.arange(0, HEAD_DIM)
@@ -461,6 +472,7 @@ def qsa_tree_attention(
         IS_FP8=key_cache.dtype == torch.float8_e4m3fn,
         num_warps=warps,
         num_stages=2,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     _qsa_tree_merge_kernel[(rows, num_query_heads)](
         node_m,
@@ -480,5 +492,6 @@ def qsa_tree_attention(
         HAS_TAIL=has_tail,
         num_warps=4 if programs == NUM_LEAVES else 2,
         num_stages=1,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return out
