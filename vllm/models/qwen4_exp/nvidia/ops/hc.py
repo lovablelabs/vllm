@@ -37,6 +37,7 @@ def _grouped_gemma_rmsnorm_kernel(
     w_offs = offs_g if W_SHARED else offsets
 
     if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
         tl.extra.cuda.gdc_wait()
 
     x = tl.load(x_ptr + row * stride_x + offsets, mask, other=0.0).to(tl.float32)
@@ -47,8 +48,6 @@ def _grouped_gemma_rmsnorm_kernel(
     y = x * rrms
     y += y * w.to(tl.float32)
 
-    if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
     tl.store(y_ptr + row * stride_y + offsets, y, mask)
 
 
@@ -95,13 +94,12 @@ def _hc_silu_kernel(
     mask = offs < DIM
 
     if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
         tl.extra.cuda.gdc_wait()
 
     x = tl.load(x_ptr + row * stride_x + offs, mask).to(tl.float32) / HC
     y = x * tl.sigmoid(x)
 
-    if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
     tl.store(y_ptr + row * stride_y + offs, y, mask)
 
 
@@ -151,6 +149,7 @@ def _hc_down_silu_sliced_kernel(
     mask = offs < WIDTH
 
     if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
         tl.extra.cuda.gdc_wait()
 
     acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
@@ -166,8 +165,6 @@ def _hc_down_silu_sliced_kernel(
     x = down / HC
     y = tl.where(offs < RANK, x * tl.sigmoid(x), down)
 
-    if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
     tl.store(y_ptr + row * stride_y + offs, y, mask)
 
 
@@ -238,6 +235,7 @@ def _hc_gate_mix_kernel(
     mask = offs_inner < HC_DIM
 
     if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
         tl.extra.cuda.gdc_wait()
 
     # The constexpr loop is unrolled and keeps one stream live at a time.
@@ -250,8 +248,6 @@ def _hc_gate_mix_kernel(
         acc += tl.sigmoid(g.to(tl.float32)) * x.to(tl.float32)
     acc /= HC
 
-    if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
     tl.store(y_ptr + row * stride_y + offs_inner, acc, mask)
 
 
@@ -308,6 +304,7 @@ def _hc_combine_kernel(
     mask = mask_hc[:, None] & mask_inner[None, :]
 
     if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
         tl.extra.cuda.gdc_wait()
 
     if inj_ptr is not None:
@@ -322,8 +319,6 @@ def _hc_combine_kernel(
         block = block.to(tl.float32)[None, :] * inj[:, None]
     out = res.to(tl.float32) + block.to(tl.float32)
 
-    if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
     tl.store(out_ptr + row * stride_out + offs, out, mask=mask)
 
 
