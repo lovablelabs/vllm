@@ -74,6 +74,7 @@ class GatedResidual(nn.Module):
         config: HyperConnectionConfig,
         use_combine: bool = True,
         prefix: str = "",
+        sliced_final_down: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -127,6 +128,18 @@ class GatedResidual(nn.Module):
                 prefix=maybe_prefix(prefix, "input_mix_weight_down"),
                 return_bias=False,
             )
+            # Deterministic serving: a final mixer's down projection on the
+            # K-sliced GEMM, as the per-layer HC downs (cuBLASLt without
+            # split-K takes ~14 us at a few rows for K = hc_count * hidden).
+            weight = self.input_mix_weight_down.weight
+            self._sliced_final_down = (
+                sliced_final_down
+                and envs.VLLM_DETERMINISTIC_SERVING
+                and weight.shape[1] % HC_DOWN_SLICES == 0
+                and weight.dtype == torch.bfloat16
+                and current_platform.has_device_capability(90)
+            )
+            self._final_down_padded: torch.Tensor | None = None
         self.input_mix_weight_up = ReplicatedLinear(
             self.lora_rank,
             self.hyper_hidden_size,
@@ -137,11 +150,25 @@ class GatedResidual(nn.Module):
             return_bias=False,
         )
 
+    def _sliced_final_down_silu(self, xn: torch.Tensor) -> torch.Tensor:
+        # The sliced GEMM also writes hc_count injection columns: give it a
+        # copy of the weight with zero rows for them (built on the first,
+        # eager, call).
+        padded = self._final_down_padded
+        if padded is None:
+            weight = self.input_mix_weight_down.weight
+            pad = (-(self.lora_rank + self.hc_count)) % 16 + self.hc_count
+            padded = torch.cat([weight, weight.new_zeros(pad, weight.shape[1])])
+            self._final_down_padded = padded
+        return hc_down_silu_sliced(xn, padded, self.lora_rank, self.hc_count)[0]
+
     def _down_and_inject(
         self, xn: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Down projection + SiLU; also returns injection logits if combined."""
         if not self.use_combine:
+            if self._sliced_final_down:
+                return self._sliced_final_down_silu(xn), None
             return hc_silu(self.input_mix_weight_down(xn), self.hc_count), None
 
         num_tokens = xn.shape[0]
